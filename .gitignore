@@ -4,3 +4,7 @@ __pycache__/
 realPictures/
 .DS_Store
 FULL_IMAGE_PADDLE_FLOW.md
+all_det_json/
+model/
+outputs_loose/
+outputs_sam_label/
