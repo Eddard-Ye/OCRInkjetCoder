@@ -1,0 +1,6 @@
+assets/
+__pycache__/
+.venv/
+realPictures/
+.DS_Store
+FULL_IMAGE_PADDLE_FLOW.md

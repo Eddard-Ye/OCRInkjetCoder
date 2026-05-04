@@ -1,0 +1,20 @@
+# Core (cv_roi, all scripts)
+numpy
+opencv-python
+
+# Paddle: full-image det (paddlex) + strip OCR (paddleocr)
+paddlepaddle
+paddleocr
+paddlex
+
+# ocr_segment: optional .xlsx export
+openpyxl
+
+# yolo_segment
+ultralytics
+
+# sam_white_label (Meta Segment Anything)
+torch
+torchvision
+# Prefer zip over git+https to avoid flaky git clone (RPC timeout / partial clone).
+segment_anything @ https://github.com/facebookresearch/segment-anything/archive/refs/heads/main.zip
