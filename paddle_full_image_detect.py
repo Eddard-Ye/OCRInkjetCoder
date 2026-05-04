@@ -19,12 +19,15 @@ Example:
   python paddle_full_image_detect.py --input data3/20260429154940.jpg --output-dir outputs_full_det
   python paddle_full_image_detect.py --input data3 --with-recognition --output-dir outputs_full_ocr
   python paddle_full_image_detect.py --input data3 --output-dir out --use-cuda --gpu-id 0
+  python paddle_full_image_detect.py --input data3 --output-dir out --json-copy-dir all_det_json
+  python paddle_full_image_detect.py --input data3 --output-dir out --with-recognition --json-only
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import time
 from pathlib import Path
 from typing import Any
@@ -331,9 +334,21 @@ def main() -> None:
     )
     parser.add_argument("--no-json", action="store_true")
     parser.add_argument(
+        "--json-copy-dir",
+        type=Path,
+        default=None,
+        help="If set, copy each *_det_boxes.json into this folder as well (same filename).",
+    )
+    parser.add_argument(
         "--no-intermediate-png",
         action="store_true",
-        help="Only write *_full_image_det_vis.png + json.",
+        help="Skip 01..04 intermediate PNGs; still write *_full_image_det_vis.png + json.",
+    )
+    parser.add_argument(
+        "--json-only",
+        action="store_true",
+        help="No PNG output (skips all visualization). Only *_det_boxes.json; "
+        "batch runs also write summary.json. Incompatible with --no-json.",
     )
     parser.add_argument(
         "--use-cuda",
@@ -347,6 +362,8 @@ def main() -> None:
         help="CUDA device index when --use-cuda (default: 0).",
     )
     args = parser.parse_args()
+    if args.json_only and args.no_json:
+        raise SystemExit("Use either --json-only (JSON only) or --no-json, not both.")
 
     inp = args.input.resolve()
     out_root = args.output_dir.resolve()
@@ -380,6 +397,11 @@ def main() -> None:
         )
 
     device_info = finalize_device_json(device_info_static)
+
+    json_copy_root: Path | None = None
+    if args.json_copy_dir is not None and not args.no_json:
+        json_copy_root = args.json_copy_dir.resolve()
+        json_copy_root.mkdir(parents=True, exist_ok=True)
 
     paths: list[Path]
     if inp.is_file():
@@ -417,31 +439,33 @@ def main() -> None:
         t_infer = time.perf_counter() - t0
 
         h0, w0 = img.shape[:2]
-        t0 = time.perf_counter()
-        vis = draw_detections(
-            img,
-            boxes,
-            draw_label=not args.no_labels,
-            det_only=not args.with_recognition,
-        )
-        boxes_only = None
-        compare = None
-        if not args.no_intermediate_png:
-            boxes_only = draw_boxes_only_canvas(h0, w0, boxes)
-            compare = np.hstack([img, vis])
-        t_render = time.perf_counter() - t0
+        if args.json_only:
+            t_render = 0.0
+        else:
+            t0 = time.perf_counter()
+            vis = draw_detections(
+                img,
+                boxes,
+                draw_label=not args.no_labels,
+                det_only=not args.with_recognition,
+            )
+            boxes_only = None
+            compare = None
+            if not args.no_intermediate_png:
+                boxes_only = draw_boxes_only_canvas(h0, w0, boxes)
+                compare = np.hstack([img, vis])
+            t_render = time.perf_counter() - t0
         stem = p.stem
 
         out_png = out_root / f"{stem}_full_image_det_vis.png"
         t0 = time.perf_counter()
-        if not args.no_intermediate_png:
-            cv2.imwrite(str(out_root / f"{stem}_01_input.png"), img)
-            if boxes_only is not None:
+        if not args.json_only:
+            if not args.no_intermediate_png:
+                cv2.imwrite(str(out_root / f"{stem}_01_input.png"), img)
                 cv2.imwrite(str(out_root / f"{stem}_02_det_boxes_only.png"), boxes_only)
-            cv2.imwrite(str(out_root / f"{stem}_03_det_overlay.png"), vis)
-            if compare is not None:
+                cv2.imwrite(str(out_root / f"{stem}_03_det_overlay.png"), vis)
                 cv2.imwrite(str(out_root / f"{stem}_04_compare_lr.png"), compare)
-        cv2.imwrite(str(out_png), vis)
+            cv2.imwrite(str(out_png), vis)
         json_path = out_root / f"{stem}_det_boxes.json"
         if not args.no_json:
             pass  # written after record dict is built
@@ -469,7 +493,7 @@ def main() -> None:
             "device": device_info,
             "boxes": boxes,
             "debug_pngs": []
-            if args.no_intermediate_png
+            if args.json_only or args.no_intermediate_png
             else [
                 f"{stem}_01_input.png",
                 f"{stem}_02_det_boxes_only.png",
@@ -483,6 +507,8 @@ def main() -> None:
             tj0 = time.perf_counter()
             with json_path.open("w", encoding="utf-8") as f:
                 json.dump(record, f, ensure_ascii=False, indent=2)
+            if json_copy_root is not None:
+                shutil.copy2(json_path, json_copy_root / json_path.name)
             timing["write"] = round(float(timing["write"] + (time.perf_counter() - tj0)), 4)
             timing["total"] = round(
                 float(timing["read"] + timing["infer"] + timing["render"] + timing["write"]),
@@ -490,7 +516,14 @@ def main() -> None:
             )
             record["timing_seconds"] = timing
 
-        if args.no_intermediate_png:
+        if args.json_only:
+            print(
+                f"{p.name}: {len(boxes)} box(es) [{mode}] "
+                f"read={timing['read']:.3f}s infer={timing['infer']:.3f}s "
+                f"render={timing['render']:.3f}s write={timing['write']:.3f}s "
+                f"total={timing['total']:.3f}s -> {stem}_det_boxes.json"
+            )
+        elif args.no_intermediate_png:
             print(
                 f"{p.name}: {len(boxes)} box(es) [{mode}] "
                 f"read={timing['read']:.3f}s infer={timing['infer']:.3f}s "
@@ -510,6 +543,8 @@ def main() -> None:
             json.dump(summary, f, ensure_ascii=False, indent=2)
 
     print(f"Done. Root: {out_root}")
+    if json_copy_root is not None:
+        print(f"JSON copies: {json_copy_root}")
 
 
 if __name__ == "__main__":
