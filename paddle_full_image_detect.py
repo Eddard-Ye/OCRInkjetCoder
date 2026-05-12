@@ -35,7 +35,8 @@ from typing import Any
 import cv2
 import numpy as np
 import paddle
-from paddlex import create_model
+
+PADDLEX_AVAILABLE = False
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 
@@ -132,6 +133,40 @@ def predict_boxes_det_only(
     min_det_score: float = 0.8,
 ) -> list[dict]:
     """Run PP-OCR text detector only; returns polygons + detector confidence."""
+    from paddleocr import PaddleOCR
+    
+    if isinstance(det_model, PaddleOCR):
+        result = det_model.ocr(image_bgr, cls=False)
+        if not result or len(result) == 0:
+            return []
+        
+        boxes: list[dict] = []
+        for line in result[0]:
+            if line is None:
+                continue
+            pts = np.array(line[0], dtype=np.float32)
+            text = line[1][0] if len(line) > 1 else ""
+            score = float(line[1][1]) if len(line) > 1 else 0.0
+            
+            if score < min_det_score:
+                continue
+            
+            xs = pts[:, 0]
+            ys = pts[:, 1]
+            boxes.append({
+                "text": text,
+                "det_score": score,
+                "score": score,
+                "poly": pts.astype(np.int32).tolist(),
+                "bbox_xyxy": [
+                    float(xs.min()),
+                    float(ys.min()),
+                    float(xs.max()),
+                    float(ys.max()),
+                ],
+            })
+        return boxes
+    
     gen = det_model(
         [image_bgr],
         limit_side_len=det_limit_side_len,
@@ -147,7 +182,6 @@ def predict_boxes_det_only(
 
     polys_raw = first["dt_polys"]
     scores_raw = first["dt_scores"]
-    # paddlex may return (N,4,2) ndarray — avoid `or []` on ndarray (truth ambiguous).
     if isinstance(polys_raw, np.ndarray):
         if polys_raw.ndim == 3:
             polys = [polys_raw[i] for i in range(polys_raw.shape[0])]
@@ -198,13 +232,28 @@ def predict_boxes_full_ocr(
     image_bgr: np.ndarray,
 ) -> list[dict]:
     """Full PaddleOCR predict (det + rec). Lazy-import caller supplies engine."""
-    result = ocr_engine.predict(image_bgr)
-    first = result[0] if result else {}
-    texts = list(first.get("rec_texts", []) or [])
-    scores = list(first.get("rec_scores", []) or [])
-    polys = list(first.get("rec_polys", []) or [])
-    if not polys:
-        polys = list(first.get("rec_boxes", []) or [])
+    if hasattr(ocr_engine, 'predict'):
+        result = ocr_engine.predict(image_bgr)
+        first = result[0] if result else {}
+        texts = list(first.get("rec_texts", []) or [])
+        scores = list(first.get("rec_scores", []) or [])
+        polys = list(first.get("rec_polys", []) or [])
+        if not polys:
+            polys = list(first.get("rec_boxes", []) or [])
+    else:
+        result = ocr_engine.ocr(image_bgr, cls=True)
+        texts = []
+        scores = []
+        polys = []
+        if result and len(result) > 0 and result[0]:
+            for line in result[0]:
+                if len(line) >= 2:
+                    box = line[0]
+                    text = line[1][0]
+                    score = line[1][1]
+                    texts.append(text)
+                    scores.append(score)
+                    polys.append(box)
 
     boxes: list[dict] = []
     n = min(len(texts), len(scores), len(polys))
@@ -372,15 +421,23 @@ def main() -> None:
     device_kw, device_info_static = resolve_paddle_device(
         use_cuda=args.use_cuda, gpu_id=args.gpu_id
     )
+    
+    from paddleocr import PaddleOCR
     det_name = f"PP-OCRv5_{args.ocr_model_size}_det"
-    if device_kw is None:
-        det_model = create_model(model_name=det_name)
-    else:
-        det_model = create_model(model_name=det_name, device=device_kw)
+    det_model = PaddleOCR(
+        lang=args.ocr_lang,
+        use_angle_cls=False,
+        use_gpu=args.use_cuda,
+        gpu_id=args.gpu_id,
+        det_limit_side_len=args.det_limit_side_len,
+    )
+    print(f"Using PaddleOCR with {'GPU' if args.use_cuda else 'CPU'} mode")
 
     ocr_device: str | None = None
     if args.use_cuda:
         ocr_device = device_info_static.get("device_arg_passed_to_model")
+    else:
+        ocr_device = "cpu"
     ocr_engine = None
     if args.with_recognition:
         from ocr_segment import build_ocr_engine
@@ -417,7 +474,7 @@ def main() -> None:
     mode = "det_only" if not args.with_recognition else "det_plus_rec"
     for p in paths:
         t0 = time.perf_counter()
-        img = cv2.imread(str(p))
+        img = cv2.imdecode(np.fromfile(str(p), dtype=np.uint8), cv2.IMREAD_COLOR)
         t_read = time.perf_counter() - t0
         if img is None:
             print(f"Skip unreadable: {p}")
