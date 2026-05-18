@@ -1,6 +1,7 @@
 # Core (cv_roi, all scripts)
 numpy
 opencv-python
+Pillow
 
 # Paddle: full-image det (paddlex) + strip OCR (paddleocr)
 paddlepaddle
