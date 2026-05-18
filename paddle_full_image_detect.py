@@ -1,11 +1,8 @@
 #!/usr/bin/env python3
 """
-Full-image **text detection** on the original photo (no strip ROI / no cv_roi crop).
+Full-image **PaddleOCR** (PP-OCRv5 detection + recognition) on the original photo (no strip ROI).
 
-**Default: detection only** — uses PaddleX `PP-OCRv5_*_det` via `paddlex.create_model` (no recognition
-model is loaded). Boxes with detector score below `--min-det-score` (default **0.8**) are dropped from PNG + JSON.
-
-Optional `--with-recognition` loads the full PaddleOCR pipeline (det + rec) like before.
+Writes polygons, recognized text, and recognition scores per box to JSON and optional debug PNGs.
 
 Intermediate PNGs per image under --output-dir:
 
@@ -16,39 +13,81 @@ Intermediate PNGs per image under --output-dir:
   {stem}_full_image_det_vis.png
 
 Example:
-  python paddle_full_image_detect.py --input data3/20260429154940.jpg --output-dir outputs_full_det
-  python paddle_full_image_detect.py --input data3 --with-recognition --output-dir outputs_full_ocr
+  python paddle_full_image_detect.py --input data3/20260429154940.jpg --output-dir outputs
+  python paddle_full_image_detect.py --input data3 --output-dir outputs
   python paddle_full_image_detect.py --input data3 --output-dir out --use-cuda --gpu-id 0
   python paddle_full_image_detect.py --input data3 --output-dir out --json-copy-dir all_det_json
-  python paddle_full_image_detect.py --input data3 --output-dir out --with-recognition --json-only
+  python paddle_full_image_detect.py --input data3 --output-dir out --json-only
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
+import sys
 import time
 from pathlib import Path
 from typing import Any
 
 import cv2
 import numpy as np
+from PIL import Image, ImageDraw, ImageFont
 import paddle
-
-PADDLEX_AVAILABLE = False
+from paddleocr import PaddleOCR
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
+
+
+def coerce_box_text(val: Any) -> str:
+    """Turn OCR box ``text`` into ``str`` without NumPy truth-value checks."""
+    if val is None:
+        return ""
+    if isinstance(val, np.ndarray):
+        if val.size == 0:
+            return ""
+        if val.ndim == 0:
+            return str(val.item()).strip()
+        return str(val).strip()
+    return str(val).strip()
+
+
+def coerce_box_score(val: Any) -> float:
+    """Turn OCR box ``score`` into ``float`` without ``ndarray or 0`` ambiguity."""
+    if val is None:
+        return 0.0
+    if isinstance(val, np.ndarray):
+        if val.size == 0:
+            return 0.0
+        return float(np.asarray(val, dtype=np.float64).ravel()[0])
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _paddle_ocr_seq(val: Any) -> list[Any]:
+    """Normalize PaddleOCR ``predict`` list fields; never ``bool(ndarray)``."""
+    if val is None:
+        return []
+    if isinstance(val, np.ndarray):
+        if val.ndim == 0:
+            return [val.item()]
+        return val.tolist()
+    if isinstance(val, (list, tuple)):
+        return list(val)
+    return [val]
 
 
 def resolve_paddle_device(
     *, use_cuda: bool, gpu_id: int
 ) -> tuple[str | None, dict[str, Any]]:
     """
-    Map CLI flags to paddlex `device` and collect metadata for JSON output.
+    Map CLI flags to PaddleOCR `device` and collect metadata for JSON output.
 
     Returns:
-        (device_kwarg_for_create_model, static_device_info)
+        (device_kwarg_for_paddleocr, static_device_info)
         device_kwarg: None = leave default (often GPU if available), else 'cpu' or 'gpu:N'.
     """
     compiled = bool(paddle.device.is_compiled_with_cuda())
@@ -98,6 +137,38 @@ def finalize_device_json(static_info: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def build_ocr_engine(
+    ocr_lang: str,
+    use_angle_cls: bool,
+    ocr_model_size: str,
+    det_limit_side_len: int,
+    det_thresh: float,
+    det_box_thresh: float,
+    det_unclip_ratio: float,
+    device: str | None = None,
+) -> PaddleOCR:
+    """Construct PaddleOCR (PP-OCRv5 det+rec) for full-image predict."""
+    det_model = f"PP-OCRv5_{ocr_model_size}_det"
+    rec_model = f"PP-OCRv5_{ocr_model_size}_rec"
+    kwargs: dict[str, Any] = {}
+    if device is not None:
+        kwargs["device"] = device
+    return PaddleOCR(
+        use_doc_orientation_classify=False,
+        use_doc_unwarping=False,
+        use_textline_orientation=use_angle_cls,
+        text_detection_model_name=det_model,
+        text_recognition_model_name=rec_model,
+        text_det_limit_side_len=det_limit_side_len,
+        text_det_limit_type="max",
+        text_det_thresh=det_thresh,
+        text_det_box_thresh=det_box_thresh,
+        text_det_unclip_ratio=det_unclip_ratio,
+        lang=ocr_lang,
+        **kwargs,
+    )
+
+
 def iter_images(folder: Path) -> list[Path]:
     out: list[Path] = []
     for p in sorted(folder.rglob("*")):
@@ -121,143 +192,54 @@ def _poly_to_points(poly: np.ndarray) -> np.ndarray | None:
     return poly.astype(np.int32)
 
 
-def predict_boxes_det_only(
-    det_model,
+def prepare_bgr_for_predict(image_bgr: np.ndarray) -> np.ndarray:
+    """
+  Normalize camera / OpenCV buffers for ``PaddleOCR.predict``.
+
+  Live grab buffers may be non-contiguous or non-uint8; ``cv2.imwrite`` + ``imread``
+  often hides that. UI and CLI should call this before predict.
+    """
+    img = np.asarray(image_bgr)
+    if img.size == 0:
+        return img
+    if img.ndim == 2:
+        img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    elif img.ndim == 3 and img.shape[2] == 4:
+        img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+    if img.dtype != np.uint8:
+        img = np.clip(img, 0, 255).astype(np.uint8)
+    return np.ascontiguousarray(img)
+
+
+def predict_boxes(
+    ocr_engine: PaddleOCR,
     image_bgr: np.ndarray,
     *,
-    det_limit_side_len: int,
-    det_thresh: float,
-    det_box_thresh: float,
-    det_unclip_ratio: float,
-    max_side_limit: int = 4000,
-    min_det_score: float = 0.8,
-) -> list[dict]:
-    """Run PP-OCR text detector only; returns polygons + detector confidence."""
-    from paddleocr import PaddleOCR
-    
-    if isinstance(det_model, PaddleOCR):
-        result = det_model.ocr(image_bgr, cls=False)
-        if not result or len(result) == 0:
-            return []
-        
-        boxes: list[dict] = []
-        for line in result[0]:
-            if line is None:
-                continue
-            pts = np.array(line[0], dtype=np.float32)
-            text = line[1][0] if len(line) > 1 else ""
-            score = float(line[1][1]) if len(line) > 1 else 0.0
-            
-            if score < min_det_score:
-                continue
-            
-            xs = pts[:, 0]
-            ys = pts[:, 1]
-            boxes.append({
-                "text": text,
-                "det_score": score,
-                "score": score,
-                "poly": pts.astype(np.int32).tolist(),
-                "bbox_xyxy": [
-                    float(xs.min()),
-                    float(ys.min()),
-                    float(xs.max()),
-                    float(ys.max()),
-                ],
-            })
-        return boxes
-    
-    gen = det_model(
-        [image_bgr],
-        limit_side_len=det_limit_side_len,
-        limit_type="max",
-        thresh=det_thresh,
-        box_thresh=det_box_thresh,
-        unclip_ratio=det_unclip_ratio,
-        max_side_limit=max_side_limit,
-    )
-    first = next(iter(gen), None)
-    if first is None:
-        return []
+    return_debug: bool = False,
+) -> list[dict] | tuple[list[dict], dict[str, int]]:
+    """Run PaddleOCR predict (det + rec); returns boxes with text and recognition score.
 
-    polys_raw = first["dt_polys"]
-    scores_raw = first["dt_scores"]
-    if isinstance(polys_raw, np.ndarray):
-        if polys_raw.ndim == 3:
-            polys = [polys_raw[i] for i in range(polys_raw.shape[0])]
-        elif polys_raw.ndim == 2:
-            polys = [polys_raw]
-        else:
-            polys = []
-    elif polys_raw is None:
-        polys = []
-    else:
-        polys = list(polys_raw)
+    Drops boxes whose stripped text has at most 3 non-whitespace characters.
+  If ``return_debug`` is True, also return raw recognition count before filtering.
+    """
+    image_bgr = prepare_bgr_for_predict(image_bgr)
+    result = ocr_engine.predict(image_bgr)
+    first = result[0] if result else {}
+    texts = _paddle_ocr_seq(first.get("rec_texts", []))
+    scores = _paddle_ocr_seq(first.get("rec_scores", []))
+    polys = _paddle_ocr_seq(first.get("rec_polys", []))
+    if not polys:
+        polys = _paddle_ocr_seq(first.get("rec_boxes", []))
 
-    if isinstance(scores_raw, np.ndarray):
-        scores = [float(scores_raw[i]) for i in range(scores_raw.shape[0])]
-    elif scores_raw is None:
-        scores = []
-    else:
-        scores = [float(x) for x in list(scores_raw)]
+    raw_rec_count = min(len(texts), len(scores), len(polys))
     boxes: list[dict] = []
-    for i, poly in enumerate(polys):
-        pts = _poly_to_points(np.asarray(poly))
-        if pts is None:
-            continue
-        xs = pts[:, 0].astype(np.float32)
-        ys = pts[:, 1].astype(np.float32)
-        det_sc = float(scores[i]) if i < len(scores) else 0.0
-        if det_sc < min_det_score:
-            continue
-        boxes.append(
-            {
-                "text": "",
-                "det_score": det_sc,
-                "score": det_sc,
-                "poly": pts.tolist(),
-                "bbox_xyxy": [
-                    float(xs.min()),
-                    float(ys.min()),
-                    float(xs.max()),
-                    float(ys.max()),
-                ],
-            }
-        )
-    return boxes
-
-
-def predict_boxes_full_ocr(
-    ocr_engine,
-    image_bgr: np.ndarray,
-) -> list[dict]:
-    """Full PaddleOCR predict (det + rec). Lazy-import caller supplies engine."""
-    if hasattr(ocr_engine, 'predict'):
-        result = ocr_engine.predict(image_bgr)
-        first = result[0] if result else {}
-        texts = list(first.get("rec_texts", []) or [])
-        scores = list(first.get("rec_scores", []) or [])
-        polys = list(first.get("rec_polys", []) or [])
-        if not polys:
-            polys = list(first.get("rec_boxes", []) or [])
-    else:
-        result = ocr_engine.ocr(image_bgr, cls=True)
-        texts = []
-        scores = []
-        polys = []
-        if result and len(result) > 0 and result[0]:
-            for line in result[0]:
-                if len(line) >= 2:
-                    box = line[0]
-                    text = line[1][0]
-                    score = line[1][1]
-                    texts.append(text)
-                    scores.append(score)
-                    polys.append(box)
-
-    boxes: list[dict] = []
-    n = min(len(texts), len(scores), len(polys))
+    n = raw_rec_count
     for i in range(n):
+        text = coerce_box_text(texts[i])
+        # 有效字符：去掉空白后的长度；仅保留超过 3 个有效字符的框
+        effective = "".join(text.split())
+        if len(effective) <= 3:
+            continue
         poly = np.asarray(polys[i])
         pts = _poly_to_points(poly)
         if pts is None:
@@ -266,9 +248,9 @@ def predict_boxes_full_ocr(
         ys = pts[:, 1].astype(np.float32)
         boxes.append(
             {
-                "text": str(texts[i]).strip(),
+                "text": text,
                 "det_score": None,
-                "score": float(scores[i]),
+                "score": coerce_box_score(scores[i]),
                 "poly": pts.tolist(),
                 "bbox_xyxy": [
                     float(xs.min()),
@@ -278,7 +260,70 @@ def predict_boxes_full_ocr(
                 ],
             }
         )
+    if return_debug:
+        return boxes, {
+            "raw_rec_count": int(raw_rec_count),
+            "boxes_after_filter": len(boxes),
+        }
     return boxes
+
+
+def _load_cjk_label_font(size: int = 18) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    """TrueType font that can render Chinese labels (``cv2.putText`` cannot)."""
+    if sys.platform == "win32":
+        windir = os.environ.get("WINDIR", r"C:\Windows")
+        candidates = [
+            os.path.join(windir, "Fonts", "msyh.ttc"),
+            os.path.join(windir, "Fonts", "msyhbd.ttc"),
+            os.path.join(windir, "Fonts", "simhei.ttf"),
+            os.path.join(windir, "Fonts", "simsun.ttc"),
+        ]
+    else:
+        candidates = [
+            "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+            "/System/Library/Fonts/PingFang.ttc",
+            "/System/Library/Fonts/STHeiti Light.ttc",
+        ]
+    for path in candidates:
+        if path and os.path.isfile(path):
+            try:
+                return ImageFont.truetype(path, size=size)
+            except OSError:
+                continue
+    return ImageFont.load_default()
+
+
+def _draw_label_on_bgr(
+    vis_bgr: np.ndarray,
+    text: str,
+    x: int,
+    y: int,
+    *,
+    font_size: int = 18,
+) -> np.ndarray:
+    """Draw UTF-8 label with PIL; ``y`` is the desired top edge (clamped in-image)."""
+    if not text:
+        return vis_bgr
+    h, w = vis_bgr.shape[:2]
+    font = _load_cjk_label_font(font_size)
+    rgb = cv2.cvtColor(vis_bgr, cv2.COLOR_BGR2RGB)
+    pil = Image.fromarray(rgb)
+    draw = ImageDraw.Draw(pil)
+    # textbbox: (left, top, right, bottom) relative to anchor
+    bbox = draw.textbbox((0, 0), text, font=font)
+    tw = bbox[2] - bbox[0]
+    th = bbox[3] - bbox[1]
+    tx = int(np.clip(x, 0, max(0, w - tw - 1)))
+    ty = int(np.clip(y, 0, max(0, h - th - 1)))
+    pad = 2
+    draw.rectangle(
+        (tx - pad, ty - pad, tx + tw + pad, ty + th + pad),
+        fill=(0, 0, 0),
+    )
+    draw.text((tx, ty), text, font=font, fill=(0, 220, 0))
+    return cv2.cvtColor(np.asarray(pil), cv2.COLOR_RGB2BGR)
 
 
 def draw_boxes_only_canvas(
@@ -300,7 +345,6 @@ def draw_detections(
     boxes: list[dict],
     *,
     draw_label: bool,
-    det_only: bool,
 ) -> np.ndarray:
     vis = image_bgr.copy()
     h, w = vis.shape[:2]
@@ -313,69 +357,45 @@ def draw_detections(
             continue
         x1 = int(np.clip(np.min(pts[:, 0]), 0, w - 1))
         y1 = int(np.clip(np.min(pts[:, 1]) - 4, 0, h - 1))
-        if det_only or not (b.get("text") or "").strip():
-            raw_ds = b.get("det_score")
-            if raw_ds is None:
-                raw_ds = b.get("score")
-            if raw_ds is None:
-                raw_ds = 0.0
-            ds = float(raw_ds)
-            label = f"{i}: det={ds:.2f}"
+        txt = coerce_box_text(b.get("text"))
+        if txt:
+            label = f"{i}: {txt[:40]}"
         else:
-            label = f"{i}: {b['text'][:40]}"
-        cv2.putText(
-            vis,
-            label,
-            (x1, y1),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
-            (0, 200, 0),
-            1,
-            cv2.LINE_AA,
-        )
+            sc = coerce_box_score(b.get("score"))
+            label = f"{i}: (empty) rec={sc:.2f}"
+        font_px = max(14, min(22, int(round(h / 120))))
+        vis = _draw_label_on_bgr(vis, label, x1, max(0, y1 - font_px - 4), font_size=font_px)
     return vis
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Full-image PP-OCR **text detection** (default: det-only, no recognition)."
+        description="Full-image PaddleOCR (PP-OCRv5 detection + recognition)."
     )
     parser.add_argument("--input", type=Path, required=True, help="Image file or folder.")
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("outputs_full_det"),
-        help="Output directory. Default: outputs_full_det",
-    )
-    parser.add_argument(
-        "--with-recognition",
-        action="store_true",
-        help="Also run recognition (loads det+rec; slower). Default is detection only.",
+        default=Path("outputs"),
+        help="Output directory. Default: outputs",
     )
     parser.add_argument(
         "--ocr-model-size",
         choices=["mobile", "server"],
         default="mobile",
-        help="PP-OCRv5 text_detection model variant (and rec if --with-recognition).",
+        help="PP-OCRv5 detector and recognizer variant (mobile or server).",
     )
-    parser.add_argument("--ocr-lang", default="ch", help="Only used with --with-recognition.")
+    parser.add_argument("--ocr-lang", default="ch", help="PaddleOCR lang (e.g. ch, en).")
     parser.add_argument(
         "--use-angle-cls",
         action="store_true",
         default=True,
-        help="Only used with --with-recognition.",
+        help="Enable text-line orientation (angle classification).",
     )
     parser.add_argument("--det-limit-side-len", type=int, default=2560)
-    parser.add_argument("--det-thresh", type=float, default=0.2)
+    parser.add_argument("--det-thresh", type=float, default=0.10)
     parser.add_argument("--det-box-thresh", type=float, default=0.35)
     parser.add_argument("--det-unclip-ratio", type=float, default=2.0)
-    parser.add_argument(
-        "--min-det-score",
-        type=float,
-        default=0.5,
-        help="det-only mode: drop boxes with detector score below this (default 0.8). "
-        "Ignored for --with-recognition (det scores not exposed per box).",
-    )
     parser.add_argument(
         "--no-labels",
         action="store_true",
@@ -402,7 +422,7 @@ def main() -> None:
     parser.add_argument(
         "--use-cuda",
         action="store_true",
-        help="Request GPU via PaddleX (e.g. device=gpu:0). Falls back to CPU if unavailable.",
+        help="Request GPU for PaddleOCR (e.g. device=gpu:0). Falls back to CPU if unavailable.",
     )
     parser.add_argument(
         "--gpu-id",
@@ -418,41 +438,26 @@ def main() -> None:
     out_root = args.output_dir.resolve()
     out_root.mkdir(parents=True, exist_ok=True)
 
-    device_kw, device_info_static = resolve_paddle_device(
+    _, device_info_static = resolve_paddle_device(
         use_cuda=args.use_cuda, gpu_id=args.gpu_id
     )
-    
-    from paddleocr import PaddleOCR
-    det_name = f"PP-OCRv5_{args.ocr_model_size}_det"
-    det_model = PaddleOCR(
-        lang=args.ocr_lang,
-        use_angle_cls=False,
-        use_gpu=args.use_cuda,
-        gpu_id=args.gpu_id,
-        det_limit_side_len=args.det_limit_side_len,
-    )
-    print(f"Using PaddleOCR with {'GPU' if args.use_cuda else 'CPU'} mode")
 
     ocr_device: str | None = None
     if args.use_cuda:
         ocr_device = device_info_static.get("device_arg_passed_to_model")
-    else:
-        ocr_device = "cpu"
-    ocr_engine = None
-    if args.with_recognition:
-        from ocr_segment import build_ocr_engine
+    ocr_engine = build_ocr_engine(
+        args.ocr_lang,
+        args.use_angle_cls,
+        args.ocr_model_size,
+        args.det_limit_side_len,
+        args.det_thresh,
+        args.det_box_thresh,
+        args.det_unclip_ratio,
+        device=ocr_device,
+    )
 
-        ocr_engine = build_ocr_engine(
-            args.ocr_lang,
-            args.use_angle_cls,
-            args.ocr_model_size,
-            args.det_limit_side_len,
-            args.det_thresh,
-            args.det_box_thresh,
-            args.det_unclip_ratio,
-            device=ocr_device,
-        )
-
+    det_name = f"PP-OCRv5_{args.ocr_model_size}_det"
+    rec_name = f"PP-OCRv5_{args.ocr_model_size}_rec"
     device_info = finalize_device_json(device_info_static)
 
     json_copy_root: Path | None = None
@@ -471,28 +476,17 @@ def main() -> None:
         raise SystemExit(f"Not a file or directory: {inp}")
 
     summary: list[dict] = []
-    mode = "det_only" if not args.with_recognition else "det_plus_rec"
+    mode = "paddleocr"
     for p in paths:
         t0 = time.perf_counter()
-        img = cv2.imdecode(np.fromfile(str(p), dtype=np.uint8), cv2.IMREAD_COLOR)
+        img = cv2.imread(str(p))
         t_read = time.perf_counter() - t0
         if img is None:
             print(f"Skip unreadable: {p}")
             continue
 
         t0 = time.perf_counter()
-        if args.with_recognition:
-            boxes = predict_boxes_full_ocr(ocr_engine, img)
-        else:
-            boxes = predict_boxes_det_only(
-                det_model,
-                img,
-                det_limit_side_len=args.det_limit_side_len,
-                det_thresh=args.det_thresh,
-                det_box_thresh=args.det_box_thresh,
-                det_unclip_ratio=args.det_unclip_ratio,
-                min_det_score=args.min_det_score,
-            )
+        boxes = predict_boxes(ocr_engine, img)
         t_infer = time.perf_counter() - t0
 
         h0, w0 = img.shape[:2]
@@ -504,7 +498,6 @@ def main() -> None:
                 img,
                 boxes,
                 draw_label=not args.no_labels,
-                det_only=not args.with_recognition,
             )
             boxes_only = None
             compare = None
@@ -542,6 +535,7 @@ def main() -> None:
             "file": p.name,
             "mode": mode,
             "det_model": det_name,
+            "rec_model": rec_name,
             "width": int(w0),
             "height": int(h0),
             "box_count": len(boxes),

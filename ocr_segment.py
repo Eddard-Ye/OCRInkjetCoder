@@ -216,6 +216,7 @@ def build_ocr_engine(
     kwargs: dict = {}
     if device is not None:
         kwargs["device"] = device
+        kwargs["use_gpu"] = device.startswith("gpu")
     return PaddleOCR(
         use_doc_orientation_classify=False,
         use_doc_unwarping=False,
@@ -235,13 +236,28 @@ def build_ocr_engine(
 def ocr_roi_lines(
     roi_bgr: np.ndarray, ocr_engine: PaddleOCR
 ) -> list[tuple[str, float, tuple[int, int, int, int]]]:
-    result = ocr_engine.predict(roi_bgr)
-    first = result[0] if result else {}
-    texts = first.get("rec_texts", []) if hasattr(first, "get") else []
-    scores = first.get("rec_scores", []) if hasattr(first, "get") else []
-    polys = first.get("rec_polys", []) if hasattr(first, "get") else []
-    if len(polys) == 0 and hasattr(first, "get"):
-        polys = first.get("rec_boxes", [])
+    if hasattr(ocr_engine, 'predict'):
+        result = ocr_engine.predict(roi_bgr)
+        first = result[0] if result else {}
+        texts = first.get("rec_texts", []) if hasattr(first, "get") else []
+        scores = first.get("rec_scores", []) if hasattr(first, "get") else []
+        polys = first.get("rec_polys", []) if hasattr(first, "get") else []
+        if len(polys) == 0 and hasattr(first, "get"):
+            polys = first.get("rec_boxes", [])
+    else:
+        result = ocr_engine.ocr(roi_bgr, cls=True)
+        texts = []
+        scores = []
+        polys = []
+        if result and len(result) > 0 and result[0]:
+            for line in result[0]:
+                if len(line) >= 2:
+                    box = line[0]
+                    text = line[1][0]
+                    score = line[1][1]
+                    texts.append(text)
+                    scores.append(score)
+                    polys.append(box)
 
     lines: list[tuple[str, float, tuple[int, int, int, int]]] = []
     n = min(len(texts), len(scores), len(polys))

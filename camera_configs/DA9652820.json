@@ -1,0 +1,125 @@
+{
+  "serial": "DA9652820",
+  "saved_at": "2026-05-15T07:38:37.439606+00:00",
+  "rows": [
+    {
+      "key": "Width",
+      "ftype": "int",
+      "value": "3072",
+      "range": "[376, 3072] step 8",
+      "read_ok": true
+    },
+    {
+      "key": "Height",
+      "ftype": "int",
+      "value": "2048",
+      "range": "[320, 2048] step 2",
+      "read_ok": true
+    },
+    {
+      "key": "OffsetX",
+      "ftype": "int",
+      "value": "0",
+      "range": "[0, 0] step 2",
+      "read_ok": true
+    },
+    {
+      "key": "OffsetY",
+      "ftype": "int",
+      "value": "0",
+      "range": "[0, 0] step 2",
+      "read_ok": true
+    },
+    {
+      "key": "PixelFormat",
+      "ftype": "enum",
+      "value": "BayerRG8",
+      "range": "enum cur=17301513",
+      "read_ok": true
+    },
+    {
+      "key": "AcquisitionMode",
+      "ftype": "enum",
+      "value": "Continuous",
+      "range": "enum cur=2",
+      "read_ok": true
+    },
+    {
+      "key": "ExposureAuto",
+      "ftype": "enum",
+      "value": "Off",
+      "range": "enum cur=0",
+      "read_ok": true
+    },
+    {
+      "key": "ExposureTime",
+      "ftype": "float",
+      "value": "800",
+      "range": "[25, 2.49958e+06]",
+      "read_ok": true
+    },
+    {
+      "key": "GainAuto",
+      "ftype": "enum",
+      "value": "Off",
+      "range": "enum cur=0",
+      "read_ok": true
+    },
+    {
+      "key": "Gain",
+      "ftype": "float",
+      "value": "23.9811992645",
+      "range": "[0, 23.9812]",
+      "read_ok": true
+    },
+    {
+      "key": "AcquisitionFrameRateEnable",
+      "ftype": "bool",
+      "value": "true",
+      "range": "true | false",
+      "read_ok": true
+    },
+    {
+      "key": "AcquisitionFrameRate",
+      "ftype": "float",
+      "value": "18.4400005341",
+      "range": "[0.4, 100000]",
+      "read_ok": true
+    },
+    {
+      "key": "TriggerMode",
+      "ftype": "enum",
+      "value": "On",
+      "range": "enum cur=1",
+      "read_ok": true
+    },
+    {
+      "key": "TriggerSource",
+      "ftype": "enum",
+      "value": "Line0",
+      "range": "enum cur=0",
+      "read_ok": true
+    },
+    {
+      "key": "TriggerActivation",
+      "ftype": "enum",
+      "value": "RisingEdge",
+      "range": "enum cur=0",
+      "read_ok": true
+    },
+    {
+      "key": "BalanceWhiteAuto",
+      "ftype": "enum",
+      "value": "Continuous",
+      "range": "enum cur=1",
+      "read_ok": true
+    },
+    {
+      "key": "DeviceUserID",
+      "ftype": "string",
+      "value": "",
+      "range": "max_len=16",
+      "read_ok": true
+    }
+  ]
+}
