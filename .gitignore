@@ -8,12 +8,3 @@ all_det_json/
 model/
 outputs_loose/
 outputs_sam_label/
-business_phrase_match_tiers.py
-organize_hik_photos_ok_ng.bat
-organize_ng_with_without_json.bat
-organize_withjson_images_json.bat
-venv_ocr/
-outputs/
-data_single/
-55237/
-test_ng_json_colon_cjk_result.txt

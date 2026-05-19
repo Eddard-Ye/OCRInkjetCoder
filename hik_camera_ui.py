@@ -106,6 +106,44 @@ _PRODUCTION_STRATEGY_COLON_CJK = "ColonCjkPhraseMatchStrategy"
 # 主窗口启动时是否最大化（Windows 下 ``state("zoomed")``；不支持则保持 geometry）。
 _START_WINDOW_MAXIMIZED = True
 
+# 主界面是否显示左侧「相机预览」面板（False 时仍取流，仅不绘制预览）。
+_SHOW_CAMERA_PREVIEW = False
+
+# NG 展示区保留的最近条目数（新 NG 插在列表顶部）。
+_NG_HISTORY_MAX = 80
+
+# OCR / 拍照时打印最近一次解码路径（sdk / opencv_bayer / packed_*）。
+_LOG_DECODE_PATH_ON_OCR = True
+
+# SDK 转像素失败时打印原因（含 ConvertPixelType 返回码）。
+_LOG_SDK_CONVERT_FAILURE = True
+
+# 仅旧版 ConvertPixelType(非 Ex) 的 BGR8 缓冲可能需要 RGB→BGR。
+# ConvertPixelTypeEx → BGR8 时为标准 OpenCV BGR，再转会红蓝/偏色，应保持 False。
+_HIK_SDK_BGR8_IS_RGB_BYTE_ORDER = False
+
+_BAYER_PIXEL_TYPES = frozenset(
+    {
+        int(PixelType_Gvsp_BayerRG8),
+        int(PixelType_Gvsp_BayerGR8),
+        int(PixelType_Gvsp_BayerGB8),
+        int(PixelType_Gvsp_BayerBG8),
+        int(PixelType_Gvsp_HB_BayerRG8),
+        int(PixelType_Gvsp_HB_BayerGR8),
+        int(PixelType_Gvsp_HB_BayerGB8),
+        int(PixelType_Gvsp_HB_BayerBG8),
+    }
+)
+
+
+def _hik_sdk_packed_to_opencv_bgr(img: np.ndarray) -> np.ndarray:
+    """SDK BGR8 缓冲 (常为 RGB 字节序) → OpenCV 标准 BGR。"""
+    if not _HIK_SDK_BGR8_IS_RGB_BYTE_ORDER:
+        return np.ascontiguousarray(img)
+    if img.ndim == 3 and img.shape[2] >= 3:
+        return cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+    return np.ascontiguousarray(img)
+
 
 def _decode_bayer8_to_bgr(
     img_bayer: np.ndarray, pixel_type: int
@@ -194,11 +232,17 @@ class HikCameraApp:
         self._stats_json_path = os.path.join(_PROJECT_ROOT, "hik_camera_ui_stats.json")
 
         self.photo_save_dir = os.path.join(os.path.expanduser("~"), "HikCameraPhotos")
+        self.photo_save_dir_ok = os.path.join(self.photo_save_dir, "ok")
+        self.photo_save_dir_ng = os.path.join(self.photo_save_dir, "ng")
         self.ocr_output_dir = os.path.join(os.path.expanduser("~"), "HikCameraOCR")
-        if not os.path.exists(self.photo_save_dir):
-            os.makedirs(self.photo_save_dir)
-        if not os.path.exists(self.ocr_output_dir):
-            os.makedirs(self.ocr_output_dir)
+        for d in (
+            self.photo_save_dir,
+            self.photo_save_dir_ok,
+            self.photo_save_dir_ng,
+            self.ocr_output_dir,
+        ):
+            if not os.path.exists(d):
+                os.makedirs(d)
 
         self.current_ocr_result = None
         self.ocr_result_image = None
@@ -240,6 +284,11 @@ class HikCameraApp:
 
         self._camera_serial_for_config = ""
         self._camera_config_dir = os.path.join(_PROJECT_ROOT, "camera_configs")
+        self._ng_history_paths: List[str] = []
+        self._last_decode_path: str = "unknown"
+        self._last_pixel_type: int = 0
+        self._last_sdk_convert_ret: int = 0
+        self._last_sdk_convert_stage: str = ""
 
         self.setup_ui()
         self.protocol()
@@ -391,32 +440,45 @@ class HikCameraApp:
         main_frame = tk.Frame(self.root, bg="#2b2b2b")
         main_frame.pack(fill="both", expand=True, padx=10, pady=5)
 
-        display_frame = tk.LabelFrame(
-            main_frame,
-            text="相机预览",
+        _panel_kw = dict(
             font=("微软雅黑", 11),
             bg="#1a1a1a",
             fg="#00ff00",
-            bd=2
+            bd=2,
         )
-        display_frame.pack(side="left", fill="both", expand=True)
 
-        self.video_label = tk.Label(
-            display_frame,
-            text="相机预览区域",
-            bg="#1a1a1a",
-            fg="#666666",
-            font=("微软雅黑", 14)
-        )
-        self.video_label.pack(fill="both", expand=True, padx=5, pady=5)
+        self.video_label: Optional[tk.Label] = None
+        if _SHOW_CAMERA_PREVIEW:
+            display_frame = tk.LabelFrame(
+                main_frame,
+                text="相机预览",
+                **_panel_kw,
+            )
+            display_frame.pack(side="left", fill="both", expand=True)
+
+            self.video_label = tk.Label(
+                display_frame,
+                text="相机预览区域",
+                bg="#1a1a1a",
+                fg="#666666",
+                font=("微软雅黑", 14),
+            )
+            self.video_label.pack(fill="both", expand=True, padx=5, pady=5)
+
+        if not _SHOW_CAMERA_PREVIEW:
+            ocr_result_frame = tk.LabelFrame(
+                main_frame,
+                text="识别结果图像",
+                **_panel_kw,
+            )
+            ocr_result_frame.pack(side="left", fill="both", expand=True)
+
+            self._pack_ocr_preview_and_ng_panel(ocr_result_frame)
 
         result_frame = tk.LabelFrame(
             main_frame,
             text="OCR识别结果",
-            font=("微软雅黑", 11),
-            bg="#1a1a1a",
-            fg="#00ff00",
-            bd=2
+            **_panel_kw,
         )
         result_frame.pack(side="right", fill="both", expand=False, padx=(10, 0))
 
@@ -433,24 +495,17 @@ class HikCameraApp:
         )
         self.result_text.pack(fill="both", expand=True, padx=5, pady=5)
 
-        ocr_result_frame = tk.LabelFrame(
-            result_frame,
-            text="识别结果图像",
-            font=("微软雅黑", 10),
-            bg="#1a1a1a",
-            fg="#00ff00",
-            bd=1
-        )
-        ocr_result_frame.pack(fill="both", expand=True, padx=5, pady=5)
-
-        self.ocr_result_label = tk.Label(
-            ocr_result_frame,
-            text="OCR结果预览",
-            bg="#1a1a1a",
-            fg="#666666",
-            font=("微软雅黑", 10)
-        )
-        self.ocr_result_label.pack(fill="both", expand=True, padx=5, pady=5)
+        if _SHOW_CAMERA_PREVIEW:
+            ocr_result_frame_nested = tk.LabelFrame(
+                result_frame,
+                text="识别结果图像",
+                font=("微软雅黑", 10),
+                bg="#1a1a1a",
+                fg="#00ff00",
+                bd=1,
+            )
+            ocr_result_frame_nested.pack(fill="both", expand=True, padx=5, pady=5)
+            self._pack_ocr_preview_and_ng_panel(ocr_result_frame_nested)
 
         info_frame = tk.Frame(self.root, bg="#2b2b2b")
         info_frame.pack(pady=3, fill="x", padx=20)
@@ -493,6 +548,94 @@ class HikCameraApp:
 
     def protocol(self):
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+
+    def _pack_ocr_preview_and_ng_panel(self, parent: tk.Widget) -> None:
+        """左侧/嵌套区：当前 OCR 渲染图 + 底部 NG 文件列表。"""
+        self.ocr_result_label = tk.Label(
+            parent,
+            text="OCR结果预览",
+            bg="#1a1a1a",
+            fg="#666666",
+            font=("微软雅黑", 10),
+        )
+        self.ocr_result_label.pack(fill="both", expand=True, padx=5, pady=5)
+        self._setup_ng_history_panel(parent)
+
+    def _setup_ng_history_panel(self, parent: tk.Widget) -> None:
+        ng_frame = tk.LabelFrame(
+            parent,
+            text="NG 展示区",
+            font=("微软雅黑", 10),
+            bg="#1a1a1a",
+            fg="#ff6666",
+            bd=1,
+        )
+        ng_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=5, pady=(0, 5))
+
+        tk.Label(
+            ng_frame,
+            text="新 NG 显示为 时间戳_NG.jpg；点击条目打开带检测框与 OK/NG 标记的图",
+            font=("微软雅黑", 8),
+            bg="#1a1a1a",
+            fg="#888888",
+            anchor="w",
+            wraplength=520,
+            justify="left",
+        ).pack(fill="x", padx=6, pady=(4, 2))
+
+        list_wrap = tk.Frame(ng_frame, bg="#1a1a1a")
+        list_wrap.pack(fill=tk.BOTH, expand=True, padx=4, pady=(0, 4))
+
+        vsb = ttk.Scrollbar(list_wrap, orient="vertical")
+        self._ng_listbox = tk.Listbox(
+            list_wrap,
+            height=6,
+            font=("Consolas", 9),
+            bg="#252525",
+            fg="#ffaaaa",
+            selectbackground="#5c2b2b",
+            selectforeground="#ffffff",
+            activestyle="none",
+            relief="sunken",
+            bd=1,
+            yscrollcommand=vsb.set,
+        )
+        vsb.config(command=self._ng_listbox.yview)
+        self._ng_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        self._ng_listbox.bind("<ButtonRelease-1>", self._on_ng_history_click)
+
+    def _register_ng_history(self, path: str, display_name: str) -> None:
+        """主线程：将刚落盘的 NG 渲染图加入展示区（最新在顶）。"""
+        lb = getattr(self, "_ng_listbox", None)
+        if lb is None:
+            return
+        if not os.path.isfile(path):
+            return
+        self._ng_history_paths.insert(0, path)
+        lb.insert(0, display_name)
+        while len(self._ng_history_paths) > _NG_HISTORY_MAX:
+            lb.delete(len(self._ng_history_paths) - 1)
+            self._ng_history_paths.pop()
+        lb.selection_clear(0, tk.END)
+        lb.selection_set(0)
+        lb.see(0)
+
+    def _on_ng_history_click(self, _event: tk.Event) -> None:
+        lb = getattr(self, "_ng_listbox", None)
+        if lb is None:
+            return
+        sel = lb.curselection()
+        if not sel:
+            return
+        idx = int(sel[0])
+        if idx < 0 or idx >= len(self._ng_history_paths):
+            return
+        path = self._ng_history_paths[idx]
+        if os.path.isfile(path):
+            os.startfile(path)
+        else:
+            messagebox.showwarning("NG", f"文件不存在:\n{path}")
 
     def update_status(self, text, color="#ffff00"):
         self.status_label.config(text=f"状态: {text}", fg=color)
@@ -625,16 +768,25 @@ class HikCameraApp:
 
         self.display_ocr_image_from_bgr(img)
 
+    @staticmethod
+    def _opencv_bgr_to_display_rgb(img_bgr: np.ndarray) -> np.ndarray:
+        """OpenCV BGR → Tk/PIL RGB（解码出口须已是真 BGR）。"""
+        if img_bgr.ndim == 2:
+            return cv2.cvtColor(img_bgr, cv2.COLOR_GRAY2RGB)
+        if img_bgr.shape[2] == 4:
+            return cv2.cvtColor(img_bgr, cv2.COLOR_BGRA2RGB)
+        return cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+
     def display_ocr_image_from_bgr(self, img_bgr: np.ndarray) -> None:
         """Show a BGR ndarray in the OCR preview panel (resized for layout)."""
         if img_bgr is None or img_bgr.size == 0:
             return
         if img_bgr.ndim == 2:
             img_bgr = cv2.cvtColor(img_bgr, cv2.COLOR_GRAY2BGR)
-        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+        img_rgb = self._opencv_bgr_to_display_rgb(img_bgr)
         img_pil = Image.fromarray(img_rgb)
 
-        display_width = 350
+        display_width = 640 if not _SHOW_CAMERA_PREVIEW else 350
         display_height = int(display_width * img_pil.height / img_pil.width)
         img_pil = img_pil.resize((display_width, display_height), Image.Resampling.LANCZOS)
 
@@ -919,6 +1071,72 @@ class HikCameraApp:
             return False, f"TriggerSource=Line0 失败 0x{ret:x}"
         return True, ""
 
+    def _finish_decode(
+        self,
+        img: Optional[np.ndarray],
+        path: str,
+        pixel_type: int,
+    ) -> Optional[np.ndarray]:
+        if img is None or getattr(img, "size", 0) == 0:
+            return None
+        self._last_decode_path = str(path)
+        self._last_pixel_type = int(pixel_type)
+        return np.ascontiguousarray(img)
+
+    def _log_decode_path_for_ocr(self, context: str) -> None:
+        if not _LOG_DECODE_PATH_ON_OCR:
+            return
+        print(
+            "[HikCameraApp] "
+            f"{context} decode_path={self._last_decode_path!r} "
+            f"pixel_type=0x{int(self._last_pixel_type):x} "
+            f"sdk_rgb_fix={_HIK_SDK_BGR8_IS_RGB_BYTE_ORDER} "
+            f"sdk_ret=0x{int(self._last_sdk_convert_ret):x}",
+            flush=True,
+        )
+
+    def _log_sdk_convert_failure(
+        self,
+        stage: str,
+        ret: int,
+        *,
+        pixel_type: int,
+        width: int,
+        height: int,
+        buf_len: int,
+        out_pixels: int,
+        nbytes: int = 0,
+    ) -> None:
+        self._last_sdk_convert_ret = int(ret)
+        self._last_sdk_convert_stage = str(stage)
+        if not _LOG_SDK_CONVERT_FAILURE:
+            return
+        npx = int(width) * int(height)
+        print(
+            "[HikCameraApp] SDK ConvertPixelTypeEx "
+            f"failed stage={stage!r} ret=0x{int(ret):x} "
+            f"pixel_type=0x{int(pixel_type):x} ({self._pixel_type_name(pixel_type)}) "
+            f"size={width}x{height} src_len={buf_len} "
+            f"expected_bayer_mono={npx} expected_bgr_out={out_pixels} "
+            f"dst_len={nbytes} "
+            f"(旧版 ConvertPixelType 的 nSrcDataLen 上限约 65535，"
+            f"全幅 Bayer 请用 Ex)",
+            flush=True,
+        )
+
+    @staticmethod
+    def _pixel_type_name(pixel_type: int) -> str:
+        pt = int(pixel_type)
+        known = {
+            int(PixelType_Gvsp_BayerRG8): "BayerRG8",
+            int(PixelType_Gvsp_BayerGR8): "BayerGR8",
+            int(PixelType_Gvsp_BayerGB8): "BayerGB8",
+            int(PixelType_Gvsp_BayerBG8): "BayerBG8",
+            int(PixelType_Gvsp_BGR8_Packed): "BGR8",
+            int(PixelType_Gvsp_RGB8_Packed): "RGB8",
+        }
+        return known.get(pt, "?")
+
     def _sdk_convert_raw_to_bgr(
         self,
         frame_data,
@@ -926,34 +1144,57 @@ class HikCameraApp:
         height: int,
         pixel_type: int,
     ) -> Optional[np.ndarray]:
-        """海康 SDK 转 BGR8（色彩/去马赛克与 MVS 预览更一致）；需已打开设备。"""
+        """
+        海康 SDK 去马赛克 → BGR8 Packed，再经 ``_hik_sdk_packed_to_opencv_bgr``。
+
+        全分辨率 Bayer（如 3072×2048）必须用 ``MV_CC_ConvertPixelTypeEx``：
+        旧版 ``ConvertPixelType`` 的宽/高/总长限制在 USHRT_MAX（65535），
+        ``nSrcDataLen`` 约 6.3MB 会失败，程序才会回退到 ``opencv_bayer``。
+        """
         if not self.b_open_device or width <= 0 or height <= 0:
-            return None
-        if width > 65535 or height > 65535:
+            self._log_sdk_convert_failure(
+                "device_closed", -1, pixel_type=pixel_type, width=width,
+                height=height, buf_len=0, out_pixels=0,
+            )
             return None
         try:
             buf_len = len(frame_data)
-            out_pixels = width * height * 3
-            row_tight = width * 3
+            out_pixels = int(width) * int(height) * 3
+            row_tight = int(width) * 3
             row_stride = (row_tight + 3) // 4 * 4
-            buf_sz = max(out_pixels, int(height * row_stride))
-            st = MV_CC_PIXEL_CONVERT_PARAM()
-            st.nWidth = width
-            st.nHeight = height
+            buf_sz = max(out_pixels, int(height) * row_stride)
+            dst_buf = (c_ubyte * buf_sz)()
+
+            st = MV_CC_PIXEL_CONVERT_PARAM_EX()
+            memset(byref(st), 0, sizeof(st))
+            st.nWidth = int(width)
+            st.nHeight = int(height)
             st.enSrcPixelType = int(pixel_type)
             st.pSrcData = cast(frame_data, POINTER(c_ubyte))
-            st.nSrcDataLen = buf_len
+            st.nSrcDataLen = int(buf_len)
             st.enDstPixelType = int(PixelType_Gvsp_BGR8_Packed)
-            dst_buf = (c_ubyte * buf_sz)()
             st.pDstBuffer = cast(dst_buf, POINTER(c_ubyte))
-            st.nDstBufferSize = buf_sz
+            st.nDstBufferSize = int(buf_sz)
             st.nDstLen = 0
-            ret = int(self.cam.MV_CC_ConvertPixelType(byref(st)))
+
+            ret = int(self.cam.MV_CC_ConvertPixelTypeEx(st))
             if ret != int(MV_OK):
+                self._log_sdk_convert_failure(
+                    "ConvertPixelTypeEx", ret,
+                    pixel_type=pixel_type, width=width, height=height,
+                    buf_len=buf_len, out_pixels=out_pixels,
+                )
                 return None
+
             nbytes = int(st.nDstLen) if int(st.nDstLen) > 0 else out_pixels
             if nbytes < out_pixels:
+                self._log_sdk_convert_failure(
+                    "short_dst_len", ret,
+                    pixel_type=pixel_type, width=width, height=height,
+                    buf_len=buf_len, out_pixels=out_pixels, nbytes=nbytes,
+                )
                 return None
+
             rawv = np.frombuffer(memoryview(dst_buf)[:nbytes], dtype=np.uint8)
             if height > 0 and nbytes % height == 0:
                 stride = nbytes // height
@@ -961,8 +1202,16 @@ class HikCameraApp:
                     wide = rawv.reshape((height, stride))
                     img = wide[:, :row_tight].reshape((height, width, 3))
                     return np.ascontiguousarray(img)
+            self._last_sdk_convert_ret = 0
+            self._last_sdk_convert_stage = "ok"
             return np.ascontiguousarray(rawv[:out_pixels].reshape((height, width, 3)))
-        except Exception:
+        except Exception as exc:
+            self._log_sdk_convert_failure(
+                f"exception:{exc}", -1,
+                pixel_type=pixel_type, width=width, height=height,
+                buf_len=len(frame_data) if frame_data is not None else 0,
+                out_pixels=int(width) * int(height) * 3,
+            )
             return None
 
     def _decode_raw_to_bgr(
@@ -971,12 +1220,14 @@ class HikCameraApp:
         width: int,
         height: int,
         pixel_type: int,
+        *,
+        log_path: bool = False,
     ) -> Optional[np.ndarray]:
         """
-        Decode one camera buffer to BGR.
+        Decode one camera buffer to OpenCV BGR.
 
-        Prefer explicit packed formats, then MV_CC_ConvertPixelType（与 MVS 一致），
-        再退回 OpenCV Bayer8。
+        Bayer/HB_Bayer：优先 SDK 去马赛克，再 ``RGB2BGR``（仅 SDK 路径，修正红蓝对调）。
+        OpenCV ``Bayer*2BGR`` 仅作 SDK 失败回退，不再套 SDK 色彩修正。
         """
         try:
             pt = int(pixel_type)
@@ -990,56 +1241,76 @@ class HikCameraApp:
                 int(PixelType_Gvsp_RGB8_Packed),
                 int(PixelType_Gvsp_HB_RGB8_Packed),
             }
-            _bayer8opencv = frozenset(
-                {
-                    int(PixelType_Gvsp_BayerRG8),
-                    int(PixelType_Gvsp_BayerGR8),
-                    int(PixelType_Gvsp_BayerGB8),
-                    int(PixelType_Gvsp_BayerBG8),
-                    int(PixelType_Gvsp_HB_BayerRG8),
-                    int(PixelType_Gvsp_HB_BayerGR8),
-                    int(PixelType_Gvsp_HB_BayerGB8),
-                    int(PixelType_Gvsp_HB_BayerBG8),
-                }
-            )
+
+            def _done(
+                img: Optional[np.ndarray], path: str
+            ) -> Optional[np.ndarray]:
+                out = self._finish_decode(img, path, pt)
+                if log_path and out is not None:
+                    h, w = out.shape[:2]
+                    print(
+                        "[HikCameraApp] decode "
+                        f"path={path!r} pixel_type=0x{pt:x} size={w}x{h}",
+                        flush=True,
+                    )
+                return out
+
+            if pt in _BAYER_PIXEL_TYPES or pt in {
+                int(PixelType_Gvsp_HB_BGR8_Packed),
+                int(PixelType_Gvsp_HB_RGB8_Packed),
+            }:
+                sdk_packed = self._sdk_convert_raw_to_bgr(
+                    frame_data, width, height, pixel_type
+                )
+                if sdk_packed is not None and sdk_packed.size > 0:
+                    return _done(
+                        _hik_sdk_packed_to_opencv_bgr(sdk_packed), "sdk_bgr8_rgb2bgr"
+                    )
+                if log_path and _LOG_SDK_CONVERT_FAILURE:
+                    print(
+                        "[HikCameraApp] Bayer SDK convert failed, "
+                        f"fallback opencv_bayer ret=0x{self._last_sdk_convert_ret:x} "
+                        f"stage={self._last_sdk_convert_stage!r}",
+                        flush=True,
+                    )
 
             if pt in _bgr_packed and buf_len >= npx * 3:
                 img = np.array(frame_data, dtype=np.uint8, copy=True).reshape(
                     (height, width, 3)
                 )
-                return np.ascontiguousarray(img)
+                return _done(img, "packed_bgr8")
             if pt in _rgb_packed and buf_len >= npx * 3:
                 img = np.array(frame_data, dtype=np.uint8, copy=True).reshape(
                     (height, width, 3)
                 )
-                return np.ascontiguousarray(
-                    cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-                )
+                return _done(cv2.cvtColor(img, cv2.COLOR_RGB2BGR), "packed_rgb8")
             if pt == int(PixelType_Gvsp_Mono8) and buf_len >= npx:
                 img = np.array(frame_data, dtype=np.uint8, copy=True).reshape(
                     (height, width)
                 )
-                return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+                return _done(cv2.cvtColor(img, cv2.COLOR_GRAY2BGR), "mono8")
 
-            sdk_bgr = self._sdk_convert_raw_to_bgr(
+            sdk_packed = self._sdk_convert_raw_to_bgr(
                 frame_data, width, height, pixel_type
             )
-            if sdk_bgr is not None and sdk_bgr.size > 0:
-                return sdk_bgr
+            if sdk_packed is not None and sdk_packed.size > 0:
+                return _done(
+                    _hik_sdk_packed_to_opencv_bgr(sdk_packed), "sdk_bgr8_rgb2bgr"
+                )
 
-            if buf_len >= npx and pt in _bayer8opencv:
+            if buf_len >= npx and pt in _BAYER_PIXEL_TYPES:
                 img = np.frombuffer(frame_data, dtype=np.uint8, count=npx).reshape(
                     (height, width)
                 )
                 decoded = _decode_bayer8_to_bgr(img, pixel_type)
                 if decoded is not None:
-                    return decoded
+                    return _done(decoded, "opencv_bayer")
 
             if buf_len >= npx:
                 img = np.frombuffer(frame_data, dtype=np.uint8, count=npx).reshape(
                     (height, width)
                 )
-                return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+                return _done(cv2.cvtColor(img, cv2.COLOR_GRAY2BGR), "mono_fallback")
         except Exception:
             return None
         return None
@@ -1158,37 +1429,46 @@ class HikCameraApp:
         pass_check: bool,
         meta_file: str,
         ocr_data: Optional[Dict[str, Any]] = None,
+        *,
+        render_bgr: Optional[np.ndarray] = None,
     ) -> None:
         """
-        Queue saving full-resolution original capture (no boxes / OK-NG overlay).
+        Queue saving capture under ``photo_save_dir_ok`` or ``photo_save_dir_ng``.
 
-        NG: always save JPEG; also save OCR result JSON alongside when ``ocr_data`` is set.
-        OK: 1/10 probability JPEG only. Directory: ``photo_save_dir``.
-        Runs disk I/O on a short-lived daemon thread so the Tk main thread is not blocked.
+        NG → ``~/HikCameraPhotos/ng/``：渲染图 ``{时间戳}_NG.jpg`` + 可选 ``.json``。
+        OK → ``~/HikCameraPhotos/ok/``：原图 ``ocr_{meta}_OK_{ts}.jpg``（约 1/10 概率）。
         """
         try:
             if pass_check and random.random() >= 0.1:
                 return
-            tag = "OK" if pass_check else "NG"
             ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
             safe = "".join(
                 c if (c.isalnum() or c in "-_") else "_" for c in (meta_file or "shot")
             )[:48]
-            fname = f"ocr_{safe}_{tag}_{ts}.jpg"
-            path = os.path.join(self.photo_save_dir, fname)
-            img = np.ascontiguousarray(frame_bgr).copy()
-            json_payload: Optional[Dict[str, Any]] = None
-            json_path: Optional[str] = None
-            if ocr_data is not None:
-                json_payload = self._ocr_snapshot_json_dict(ocr_data)
-                json_path = os.path.join(
-                    self.photo_save_dir, f"ocr_{safe}_{tag}_{ts}.json"
+            if pass_check:
+                save_dir = self.photo_save_dir_ok
+                fname = f"ocr_{safe}_OK_{ts}.jpg"
+                img = np.ascontiguousarray(frame_bgr).copy()
+                json_payload = None
+                json_path = None
+                register_ng = False
+            else:
+                save_dir = self.photo_save_dir_ng
+                fname = f"{ts}_NG.jpg"
+                src = render_bgr if render_bgr is not None else frame_bgr
+                img = np.ascontiguousarray(src).copy()
+                json_payload = (
+                    self._ocr_snapshot_json_dict(ocr_data) if ocr_data is not None else None
                 )
+                json_path = os.path.join(save_dir, f"{ts}_NG.json")
+                register_ng = True
+
+            path = os.path.join(save_dir, fname)
 
             def _worker() -> None:
                 try:
-                    if not os.path.isdir(self.photo_save_dir):
-                        os.makedirs(self.photo_save_dir, exist_ok=True)
+                    if not os.path.isdir(save_dir):
+                        os.makedirs(save_dir, exist_ok=True)
                     cv2.imwrite(
                         path,
                         img,
@@ -1197,6 +1477,16 @@ class HikCameraApp:
                     if json_payload is not None and json_path is not None:
                         with open(json_path, "w", encoding="utf-8") as f:
                             json.dump(json_payload, f, ensure_ascii=False, indent=2)
+                    if register_ng:
+                        disp = os.path.basename(path)
+
+                        def _ui() -> None:
+                            self._register_ng_history(path, disp)
+
+                        try:
+                            self.root.after(0, _ui)
+                        except Exception:
+                            pass
                 except Exception:
                     pass
 
@@ -1220,9 +1510,9 @@ class HikCameraApp:
 
         Must run on the Tk main thread if it touches widgets / messagebox.
 
-        If ``persist_original_capture`` is True (拍照+OCR / 硬触发), after OCR the
-        original ``frame_bgr`` may be written under ``photo_save_dir`` (NG always, OK 1/10).
-        NG saves a sibling ``.json`` with OCR boxes / scores / pass flag next to the JPEG.
+        If ``persist_original_capture`` is True (拍照+OCR / 硬触发), after OCR writes
+        NG under ``photo_save_dir_ng`` (always, rendered + JSON); OK under
+        ``photo_save_dir_ok`` (original, ~1/10).
         """
         if self.ocr_engine is None:
             if dialog_on_error:
@@ -1233,6 +1523,7 @@ class HikCameraApp:
             return False
 
         try:
+            self._log_decode_path_for_ocr(meta_file)
             frame_bgr = prepare_bgr_for_predict(frame_bgr)
             t0 = time.perf_counter()
             boxes, paddle_debug = predict_boxes(
@@ -1259,6 +1550,7 @@ class HikCameraApp:
                     pass_check,
                     meta_file,
                     ocr_data=None if pass_check else ocr_data,
+                    render_bgr=vis_ocr_ui if not pass_check else None,
                 )
 
             self.current_ocr_result = ocr_data
@@ -1590,10 +1882,11 @@ class HikCameraApp:
         self.b_start_grabbing = True
         self.grab_thread = threading.Thread(target=self.grab_thread_func, daemon=True)
         self.grab_thread.start()
-        try:
-            self.root.after(0, self._pump_preview_queue)
-        except Exception:
-            pass
+        if _SHOW_CAMERA_PREVIEW:
+            try:
+                self.root.after(0, self._pump_preview_queue)
+            except Exception:
+                pass
         return 0, ""
 
     def _try_set_enum_by_string(self, key: str, symbolic: str) -> int:
@@ -1982,11 +2275,14 @@ class HikCameraApp:
 
         self.grab_thread = threading.Thread(target=self.grab_thread_func, daemon=True)
         self.grab_thread.start()
-        self.root.after(0, self._pump_preview_queue)
+        if _SHOW_CAMERA_PREVIEW:
+            self.root.after(0, self._pump_preview_queue)
         self._snapshot_and_save_camera_config()
 
     def _apply_video_preview(self, bgr: np.ndarray) -> None:
         """Update camera preview from a BGR image (Tk main thread only)."""
+        if not _SHOW_CAMERA_PREVIEW or self.video_label is None:
+            return
         try:
             if bgr is None or bgr.size == 0:
                 return
@@ -1994,7 +2290,7 @@ class HikCameraApp:
                 bgr = cv2.cvtColor(bgr, cv2.COLOR_GRAY2BGR)
             if bgr.ndim != 3 or bgr.shape[2] != 3:
                 return
-            rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            rgb = self._opencv_bgr_to_display_rgb(bgr)
             img_pil = Image.fromarray(rgb)
             img_tk = ImageTk.PhotoImage(img_pil)
             self._video_preview_photo = img_tk
@@ -2004,6 +2300,8 @@ class HikCameraApp:
 
     def _pump_preview_queue(self) -> None:
         """Drain preview frames on Tk main thread (started from connect, ~30 FPS)."""
+        if not _SHOW_CAMERA_PREVIEW:
+            return
         if self.b_exit:
             return
         last: Optional[np.ndarray] = None
@@ -2019,6 +2317,8 @@ class HikCameraApp:
 
     def _schedule_video_preview(self, bgr: np.ndarray) -> None:
         """Grab thread enqueues BGR preview; main thread pump paints ``video_label``."""
+        if not _SHOW_CAMERA_PREVIEW:
+            return
         snap = np.ascontiguousarray(bgr).copy()
         try:
             self._preview_queue.put_nowait(snap)
@@ -2107,7 +2407,7 @@ class HikCameraApp:
             self.cam.MV_CC_FreeImageBuffer(stFrameInfo)
 
             decoded = self._decode_raw_to_bgr(
-                frame_data, width, height, pixel_type
+                frame_data, width, height, pixel_type, log_path=True
             )
             if decoded is not None:
                 return np.ascontiguousarray(decoded.copy())
@@ -2170,8 +2470,9 @@ class HikCameraApp:
         self.btn_disconnect.config(state="disabled")
         self.btn_capture.config(state="disabled")
         self.btn_config_camera.config(state="disabled")
-        self.video_label.config(image="", text="相机预览区域")
-        self.video_label.image = None
+        if self.video_label is not None:
+            self.video_label.config(image="", text="相机预览区域")
+            self.video_label.image = None
 
         self.update_status("相机已断开", "#ffff00")
         self.update_camera_info("相机信息: 未连接")

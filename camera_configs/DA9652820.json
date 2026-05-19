@@ -1,6 +1,6 @@
 {
   "serial": "DA9652820",
-  "saved_at": "2026-05-15T07:38:37.439606+00:00",
+  "saved_at": "2026-05-18T10:33:39.081615+00:00",
   "rows": [
     {
       "key": "Width",
@@ -54,15 +54,15 @@
     {
       "key": "ExposureTime",
       "ftype": "float",
-      "value": "800",
+      "value": "5000",
       "range": "[25, 2.49958e+06]",
       "read_ok": true
     },
     {
       "key": "GainAuto",
       "ftype": "enum",
-      "value": "Off",
-      "range": "enum cur=0",
+      "value": "Continuous",
+      "range": "enum cur=2",
       "read_ok": true
     },
     {
@@ -89,8 +89,8 @@
     {
       "key": "TriggerMode",
       "ftype": "enum",
-      "value": "On",
-      "range": "enum cur=1",
+      "value": "Off",
+      "range": "enum cur=0",
       "read_ok": true
     },
     {
