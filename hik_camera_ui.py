@@ -33,10 +33,17 @@ from paddle_full_image_detect import (
     resolve_paddle_device,
 )
 from relay_controller import RelayController
+from date_check_config import DateCheckGlobalConfig, validate_shelf_life_dates
 from production_phrase_strategy import (
     ColonCjkPhraseMatchStrategy,
     StrictExclusiveSubstringStrategy,
 )
+
+_PRODUCTION_STRATEGY_STRICT = "StrictExclusiveSubstringStrategy"
+_PRODUCTION_STRATEGY_COLON_CJK = "ColonCjkPhraseMatchStrategy"
+
+_DATE_CHECK_CONFIG_PATH = os.path.join(_PROJECT_ROOT, "hik_camera_ui_date_check.json")
+_NG_HISTORY_JSON_PATH = os.path.join(_PROJECT_ROOT, "hik_camera_ui_ng_history.json")
 
 HIK_SDK_PATH = r"D:\海康威视\MVS\Development\Samples\Python"
 SDK_PATH = os.path.join(HIK_SDK_PATH, "MvImport")
@@ -98,10 +105,6 @@ def _camera_param_apply_sort_key(key: str) -> tuple[int, str]:
 # Hik cameras often implement these as IInteger / int64 (us); GetFloatValue may lie (e.g. 1.0).
 _FLAKY_FLOAT_GENICAM_KEYS = frozenset({"ExposureTime", "Gain"})
 
-
-# OCR 产线三语校验：下拉框取值（与 ``production_phrase_strategy`` 类名一致便于对照代码）
-_PRODUCTION_STRATEGY_STRICT = "StrictExclusiveSubstringStrategy"
-_PRODUCTION_STRATEGY_COLON_CJK = "ColonCjkPhraseMatchStrategy"
 
 # 主窗口启动时是否最大化（Windows 下 ``state("zoomed")``；不支持则保持 geometry）。
 _START_WINDOW_MAXIMIZED = True
@@ -260,7 +263,8 @@ class HikCameraApp:
             serial_number="HW341",
         )
 
-        # 三语 OCR 校验策略（默认严格子串；与 ColonCjk 并存，下拉切换）
+        self._date_check_config = DateCheckGlobalConfig.load(_DATE_CHECK_CONFIG_PATH)
+
         self._strict_strategy_cfg: Dict[str, Any] = {"strict_year_suffix": False}
         self._colon_cjk_strategy_cfg: Dict[str, Any] = {
             "exclude_lines_without_year": False,
@@ -293,6 +297,7 @@ class HikCameraApp:
         self.setup_ui()
         self.protocol()
         self._load_stats_from_disk()
+        self._load_ng_history_from_disk()
         self._init_ocr_engine()
 
     def setup_ui(self):
@@ -369,6 +374,16 @@ class HikCameraApp:
         )
         self.btn_config_camera.grid(row=0, column=4, padx=5, pady=5)
 
+        self.btn_date_check_config = tk.Button(
+            control_frame,
+            text="日期检测参数",
+            command=self._open_date_check_config_dialog,
+            bg="#009688",
+            fg="white",
+            **btn_style,
+        )
+        self.btn_date_check_config.grid(row=0, column=5, padx=5, pady=5)
+
         self.btn_toggle_trigger = tk.Button(
             control_frame,
             text="切换到硬触发(Line0)",
@@ -382,7 +397,7 @@ class HikCameraApp:
             relief="raised",
             bd=2,
         )
-        self.btn_toggle_trigger.grid(row=1, column=0, columnspan=5, padx=5, pady=(0, 5))
+        self.btn_toggle_trigger.grid(row=1, column=0, columnspan=6, padx=5, pady=(0, 5))
 
         strat_frame = tk.Frame(control_frame.master, bg="#2b2b2b")
         strat_frame.pack(pady=(0, 4), fill="x", padx=10)
@@ -404,7 +419,7 @@ class HikCameraApp:
         )
         self._combo_production_strategy.pack(side=tk.LEFT, padx=4)
 
-        btn_cfg_strict = tk.Button(
+        tk.Button(
             strat_frame,
             text="编辑 Strict 配置",
             command=self._open_strict_strategy_config_dialog,
@@ -413,10 +428,9 @@ class HikCameraApp:
             fg="#ffffff",
             padx=8,
             pady=2,
-        )
-        btn_cfg_strict.pack(side=tk.LEFT, padx=(12, 4))
+        ).pack(side=tk.LEFT, padx=(12, 4))
 
-        btn_cfg_colon = tk.Button(
+        tk.Button(
             strat_frame,
             text="编辑 ColonCjk 配置",
             command=self._open_colon_cjk_strategy_config_dialog,
@@ -425,8 +439,7 @@ class HikCameraApp:
             fg="#ffffff",
             padx=8,
             pady=2,
-        )
-        btn_cfg_colon.pack(side=tk.LEFT, padx=4)
+        ).pack(side=tk.LEFT, padx=4)
 
         self.status_label = tk.Label(
             self.root,
@@ -605,18 +618,77 @@ class HikCameraApp:
         vsb.pack(side=tk.RIGHT, fill=tk.Y)
         self._ng_listbox.bind("<ButtonRelease-1>", self._on_ng_history_click)
 
-    def _register_ng_history(self, path: str, display_name: str) -> None:
-        """主线程：将刚落盘的 NG 渲染图加入展示区（最新在顶）。"""
+    def _load_ng_history_from_disk(self) -> None:
+        """启动时恢复 NG 展示区列表（``hik_camera_ui_ng_history.json``）。"""
+        paths: List[str] = []
+        if os.path.isfile(_NG_HISTORY_JSON_PATH):
+            try:
+                with open(_NG_HISTORY_JSON_PATH, encoding="utf-8") as f:
+                    raw = json.load(f)
+                if isinstance(raw, list):
+                    items = raw
+                elif isinstance(raw, dict):
+                    items = raw.get("entries", raw.get("paths", []))
+                else:
+                    items = []
+                for item in items:
+                    if isinstance(item, str):
+                        p = item.strip()
+                    elif isinstance(item, dict):
+                        p = str(item.get("path") or "").strip()
+                    else:
+                        continue
+                    if p:
+                        paths.append(os.path.normpath(p))
+            except Exception:
+                paths = []
+        seen: set[str] = set()
+        unique: List[str] = []
+        for p in paths:
+            if p in seen:
+                continue
+            seen.add(p)
+            unique.append(p)
+        self._ng_history_paths = unique[:_NG_HISTORY_MAX]
+        self._refresh_ng_listbox_ui()
+
+    def _persist_ng_history_to_disk(self) -> None:
+        try:
+            payload = {
+                "entries": [
+                    {"path": p, "display": os.path.basename(p)}
+                    for p in self._ng_history_paths
+                ],
+                "saved_at": datetime.now(timezone.utc).isoformat(),
+            }
+            with open(_NG_HISTORY_JSON_PATH, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    def _refresh_ng_listbox_ui(self) -> None:
         lb = getattr(self, "_ng_listbox", None)
         if lb is None:
             return
-        if not os.path.isfile(path):
+        lb.delete(0, tk.END)
+        for p in self._ng_history_paths:
+            lb.insert(tk.END, os.path.basename(p))
+
+    def _register_ng_history(self, path: str, display_name: str) -> None:
+        """主线程：将刚落盘的 NG 渲染图加入展示区（最新在顶）并持久化。"""
+        if getattr(self, "_ng_listbox", None) is None:
             return
-        self._ng_history_paths.insert(0, path)
-        lb.insert(0, display_name)
-        while len(self._ng_history_paths) > _NG_HISTORY_MAX:
-            lb.delete(len(self._ng_history_paths) - 1)
-            self._ng_history_paths.pop()
+        path_norm = os.path.normpath(path)
+        if not os.path.isfile(path_norm):
+            return
+        if path_norm in self._ng_history_paths:
+            self._ng_history_paths.remove(path_norm)
+        self._ng_history_paths.insert(0, path_norm)
+        del self._ng_history_paths[_NG_HISTORY_MAX :]
+        self._refresh_ng_listbox_ui()
+        self._persist_ng_history_to_disk()
+
+        lb = self._ng_listbox
         lb.selection_clear(0, tk.END)
         lb.selection_set(0)
         lb.see(0)
@@ -1032,17 +1104,137 @@ class HikCameraApp:
             pady=4,
         ).pack(side=tk.LEFT, padx=6)
 
+    def _open_date_check_config_dialog(self) -> None:
+        top = tk.Toplevel(self.root)
+        top.title("日期检测全局配置")
+        top.configure(bg="#2b2b2b")
+        top.transient(self.root)
+        top.grab_set()
+        top.resizable(False, False)
+
+        cfg = self._date_check_config
+        var_enable = tk.BooleanVar(value=bool(cfg.enable_date_check))
+        var_normal = tk.StringVar(value=str(int(cfg.shelf_life_normal)))
+        var_frozen = tk.StringVar(value=str(int(cfg.shelf_life_frozen)))
+
+        tk.Label(
+            top,
+            text="日期检测全局配置",
+            font=("微软雅黑", 11, "bold"),
+            bg="#2b2b2b",
+            fg="#00ff00",
+        ).pack(anchor="w", padx=14, pady=(12, 8))
+
+        tk.Checkbutton(
+            top,
+            text="启用日期检测",
+            variable=var_enable,
+            font=("微软雅黑", 10),
+            bg="#2b2b2b",
+            fg="#eeeeee",
+            selectcolor="#444444",
+            activebackground="#2b2b2b",
+            activeforeground="#ffffff",
+        ).pack(anchor="w", padx=14, pady=6)
+
+        def _spin_row(parent: tk.Widget, label: str, var: tk.StringVar) -> None:
+            row = tk.Frame(parent, bg="#2b2b2b")
+            row.pack(fill="x", padx=14, pady=6)
+            tk.Label(
+                row,
+                text=label,
+                font=("微软雅黑", 9),
+                bg="#2b2b2b",
+                fg="#cccccc",
+                width=22,
+                anchor="w",
+            ).pack(side=tk.LEFT)
+            tk.Spinbox(
+                row,
+                from_=0,
+                to=9999,
+                textvariable=var,
+                width=8,
+                font=("微软雅黑", 10),
+                justify="center",
+            ).pack(side=tk.LEFT, padx=4)
+
+        _spin_row(top, "常温存储保质期（天）", var_normal)
+        _spin_row(top, "冷冻存储保质期（天）", var_frozen)
+
+        btn_row = tk.Frame(top, bg="#2b2b2b")
+        btn_row.pack(pady=(16, 14), padx=14)
+
+        def on_save() -> None:
+            try:
+                normal_d = int(str(var_normal.get()).strip())
+                frozen_d = int(str(var_frozen.get()).strip())
+            except ValueError:
+                messagebox.showerror("错误", "保质期天数请输入整数", parent=top)
+                return
+            if normal_d < 0 or frozen_d < 0:
+                messagebox.showerror("错误", "保质期天数须 >= 0", parent=top)
+                return
+            self._date_check_config = DateCheckGlobalConfig(
+                enable_date_check=bool(var_enable.get()),
+                shelf_life_normal=normal_d,
+                shelf_life_frozen=frozen_d,
+            )
+            try:
+                self._date_check_config.save(_DATE_CHECK_CONFIG_PATH)
+            except Exception as e:
+                messagebox.showerror("保存失败", str(e), parent=top)
+                return
+            top.destroy()
+
+        tk.Button(
+            btn_row,
+            text="保存",
+            command=on_save,
+            font=("微软雅黑", 9),
+            bg="#4CAF50",
+            fg="white",
+            padx=16,
+            pady=4,
+        ).pack(side=tk.LEFT, padx=6)
+        tk.Button(
+            btn_row,
+            text="取消",
+            command=top.destroy,
+            font=("微软雅黑", 9),
+            bg="#666666",
+            fg="white",
+            padx=16,
+            pady=4,
+        ).pack(side=tk.LEFT, padx=6)
+
     def check_required_production_expiry_boxes(self, boxes: list[dict]) -> bool:
         """
-        使用界面选中的 ``production_phrase_strategy`` 策略，对 ``boxes`` 的 ``text``
-        做三语校验。通过则返回 True；否则 :meth:`callRelayAction` 并返回 False。
+        下拉策略三语校验 + 可选日期检测（``_date_check_config``）。
+
+        通过返回 True；未通过则 :meth:`callRelayAction` 并返回 False。
         """
         texts = [str(b.get("text", "") or "") for b in boxes]
+        cfg = self._date_check_config
         strategy = self._active_production_strategy()
-        if strategy.match(texts):
+
+        if not strategy.match(texts):
             self.callRelayAction()
-            return True
-        return False
+            return False
+
+        if cfg.enable_date_check and not validate_shelf_life_dates(texts, cfg):
+            self.callRelayAction()
+            return False
+
+        print(
+            "[HikCameraApp] ocr_check pass "
+            f"strategy={type(strategy).__name__} "
+            f"enable_date_check={cfg.enable_date_check} "
+            f"shelf_life_normal={cfg.shelf_life_normal} "
+            f"shelf_life_frozen={cfg.shelf_life_frozen}",
+            flush=True,
+        )
+        return True
 
     def _trigger_sdk_ints(self) -> Tuple[int, int, int]:
         """TriggerMode / TriggerSource ints from MVS headers (with safe fallbacks)."""

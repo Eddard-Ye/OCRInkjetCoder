@@ -1,8 +1,8 @@
 {
-  "manual_capture_ocr_count": 33,
+  "manual_capture_ocr_count": 131,
   "hw_trigger_capture_count": 5958,
-  "ocr_total_count": 5991,
-  "ocr_ok_count": 5874,
-  "ocr_ng_count": 117,
-  "saved_at": "2026-05-18T10:35:28.983203+00:00"
+  "ocr_total_count": 6089,
+  "ocr_ok_count": 5875,
+  "ocr_ng_count": 214,
+  "saved_at": "2026-05-20T14:06:42.529529+00:00"
 }

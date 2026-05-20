@@ -1,0 +1,5 @@
+{
+  "enable_date_check": true,
+  "shelf_life_normal": 5,
+  "shelf_life_frozen": 180
+}
