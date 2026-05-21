@@ -109,8 +109,14 @@ _FLAKY_FLOAT_GENICAM_KEYS = frozenset({"ExposureTime", "Gain"})
 # 主窗口启动时是否最大化（Windows 下 ``state("zoomed")``；不支持则保持 geometry）。
 _START_WINDOW_MAXIMIZED = True
 
-# 主界面是否显示左侧「相机预览」面板（False 时仍取流，仅不绘制预览）。
+# 主界面是否显示独立左侧「相机预览」面板（False：直播画在「识别结果图像」内）。
 _SHOW_CAMERA_PREVIEW = False
+
+# 「识别结果图像」框显示模式（连接后直播；拍照+OCR 或硬触发后仅静图）。
+_OCR_PANEL_IDLE = "idle"
+_OCR_PANEL_LIVE = "live"
+_OCR_PANEL_RESULT = "result"
+_OCR_PANEL_IDLE_TEXT = "请连接相机（连接后显示实时画面，便于调镜头）"
 
 # NG 展示区保留的最近条目数（新 NG 插在列表顶部）。
 _NG_HISTORY_MAX = 80
@@ -251,6 +257,8 @@ class HikCameraApp:
         self.ocr_result_image = None
         self.ocr_engine = None
         self._ocr_init_error: Optional[str] = None
+        self._ocr_panel_mode = _OCR_PANEL_IDLE
+        self._ocr_panel_photo: Optional[ImageTk.PhotoImage] = None
 
         relay_exe = os.path.join(
             _PROJECT_ROOT,
@@ -566,7 +574,7 @@ class HikCameraApp:
         """左侧/嵌套区：当前 OCR 渲染图 + 底部 NG 文件列表。"""
         self.ocr_result_label = tk.Label(
             parent,
-            text="OCR结果预览",
+            text=_OCR_PANEL_IDLE_TEXT,
             bg="#1a1a1a",
             fg="#666666",
             font=("微软雅黑", 10),
@@ -587,7 +595,7 @@ class HikCameraApp:
 
         tk.Label(
             ng_frame,
-            text="新 NG 显示为 时间戳_NG.jpg；点击条目打开带检测框与 OK/NG 标记的图",
+            text="新 NG 为 时间戳_NG.jpg；点击文件名打开；右侧 × 删除本条及对应照片/JSON",
             font=("微软雅黑", 8),
             bg="#1a1a1a",
             fg="#888888",
@@ -600,23 +608,40 @@ class HikCameraApp:
         list_wrap.pack(fill=tk.BOTH, expand=True, padx=4, pady=(0, 4))
 
         vsb = ttk.Scrollbar(list_wrap, orient="vertical")
-        self._ng_listbox = tk.Listbox(
+        self._ng_list_canvas = tk.Canvas(
             list_wrap,
-            height=6,
-            font=("Consolas", 9),
+            height=120,
             bg="#252525",
-            fg="#ffaaaa",
-            selectbackground="#5c2b2b",
-            selectforeground="#ffffff",
-            activestyle="none",
-            relief="sunken",
-            bd=1,
+            highlightthickness=1,
+            highlightbackground="#444444",
             yscrollcommand=vsb.set,
         )
-        vsb.config(command=self._ng_listbox.yview)
-        self._ng_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        vsb.config(command=self._ng_list_canvas.yview)
+        self._ng_list_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         vsb.pack(side=tk.RIGHT, fill=tk.Y)
-        self._ng_listbox.bind("<ButtonRelease-1>", self._on_ng_history_click)
+
+        self._ng_list_inner = tk.Frame(self._ng_list_canvas, bg="#252525")
+        self._ng_list_window = self._ng_list_canvas.create_window(
+            (0, 0),
+            window=self._ng_list_inner,
+            anchor="nw",
+        )
+
+        def _on_inner_configure(_event: tk.Event) -> None:
+            self._ng_list_canvas.configure(
+                scrollregion=self._ng_list_canvas.bbox("all")
+            )
+
+        def _on_canvas_configure(event: tk.Event) -> None:
+            self._ng_list_canvas.itemconfig(
+                self._ng_list_window, width=event.width
+            )
+
+        self._ng_list_inner.bind("<Configure>", _on_inner_configure)
+        self._ng_list_canvas.bind("<Configure>", _on_canvas_configure)
+
+        self._ng_list_canvas.bind("<MouseWheel>", self._ng_list_mousewheel)
+        self._ng_list_inner.bind("<MouseWheel>", self._ng_list_mousewheel)
 
     def _load_ng_history_from_disk(self) -> None:
         """启动时恢复 NG 展示区列表（``hik_camera_ui_ng_history.json``）。"""
@@ -650,7 +675,17 @@ class HikCameraApp:
             seen.add(p)
             unique.append(p)
         self._ng_history_paths = unique[:_NG_HISTORY_MAX]
-        self._refresh_ng_listbox_ui()
+        self._refresh_ng_list_ui()
+
+    def _ng_list_mousewheel(self, event: tk.Event) -> None:
+        canvas = getattr(self, "_ng_list_canvas", None)
+        if canvas is not None and event.delta:
+            canvas.yview_scroll(int(-event.delta / 120), "units")
+
+    @staticmethod
+    def _paired_ng_json_path(image_path: str) -> str:
+        stem, _ext = os.path.splitext(image_path)
+        return stem + ".json"
 
     def _persist_ng_history_to_disk(self) -> None:
         try:
@@ -666,17 +701,109 @@ class HikCameraApp:
         except Exception:
             pass
 
-    def _refresh_ng_listbox_ui(self) -> None:
-        lb = getattr(self, "_ng_listbox", None)
-        if lb is None:
+    def _refresh_ng_list_ui(self) -> None:
+        inner = getattr(self, "_ng_list_inner", None)
+        if inner is None:
             return
-        lb.delete(0, tk.END)
-        for p in self._ng_history_paths:
-            lb.insert(tk.END, os.path.basename(p))
+        for child in inner.winfo_children():
+            child.destroy()
+
+        row_bg = "#252525"
+        row_hover = "#3a2a2a"
+        for idx, path in enumerate(self._ng_history_paths):
+            row = tk.Frame(inner, bg=row_bg)
+            row.pack(fill=tk.X, padx=2, pady=1)
+
+            name = os.path.basename(path)
+            lbl = tk.Label(
+                row,
+                text=name,
+                font=("Consolas", 9),
+                bg=row_bg,
+                fg="#ffaaaa",
+                anchor="w",
+                cursor="hand2",
+            )
+            lbl.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 4))
+
+            def _open(_e: tk.Event, p: str = path) -> None:
+                self._open_ng_history_path(p)
+
+            lbl.bind("<ButtonRelease-1>", _open)
+            row.bind("<ButtonRelease-1>", _open)
+
+            def _on_enter(_e: tk.Event, r: tk.Frame = row, lb: tk.Label = lbl) -> None:
+                r.configure(bg=row_hover)
+                lb.configure(bg=row_hover)
+
+            def _on_leave(_e: tk.Event, r: tk.Frame = row, lb: tk.Label = lbl) -> None:
+                r.configure(bg=row_bg)
+                lb.configure(bg=row_bg)
+
+            row.bind("<Enter>", _on_enter)
+            row.bind("<Leave>", _on_leave)
+            lbl.bind("<Enter>", _on_enter)
+            lbl.bind("<Leave>", _on_leave)
+
+            btn_del = tk.Button(
+                row,
+                text="×",
+                command=lambda i=idx: self._delete_ng_history_entry(i),
+                font=("微软雅黑", 10, "bold"),
+                fg="#ffffff",
+                bg="#8b3030",
+                activebackground="#b04040",
+                activeforeground="#ffffff",
+                relief="flat",
+                bd=0,
+                padx=6,
+                pady=0,
+                cursor="hand2",
+            )
+            btn_del.pack(side=tk.RIGHT, padx=(2, 4))
+            for w in (row, lbl, btn_del):
+                w.bind("<MouseWheel>", self._ng_list_mousewheel)
+
+        canvas = getattr(self, "_ng_list_canvas", None)
+        if canvas is not None:
+            canvas.update_idletasks()
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+    def _open_ng_history_path(self, path: str) -> None:
+        if os.path.isfile(path):
+            os.startfile(path)
+        else:
+            messagebox.showwarning("NG", f"文件不存在:\n{path}")
+
+    def _delete_ng_history_files(self, image_path: str) -> List[str]:
+        """Delete NG jpg and paired json; return list of paths that failed to delete."""
+        failed: List[str] = []
+        for fp in (image_path, self._paired_ng_json_path(image_path)):
+            if not os.path.isfile(fp):
+                continue
+            try:
+                os.remove(fp)
+            except OSError:
+                failed.append(fp)
+        return failed
+
+    def _delete_ng_history_entry(self, index: int) -> None:
+        if index < 0 or index >= len(self._ng_history_paths):
+            return
+        path = self._ng_history_paths[index]
+        failed = self._delete_ng_history_files(path)
+        del self._ng_history_paths[index]
+        self._refresh_ng_list_ui()
+        self._persist_ng_history_to_disk()
+        if failed:
+            messagebox.showwarning(
+                "NG",
+                "列表已更新，但以下文件未能删除:\n" + "\n".join(failed),
+            )
 
     def _register_ng_history(self, path: str, display_name: str) -> None:
         """主线程：将刚落盘的 NG 渲染图加入展示区（最新在顶）并持久化。"""
-        if getattr(self, "_ng_listbox", None) is None:
+        if getattr(self, "_ng_list_inner", None) is None:
             return
         path_norm = os.path.normpath(path)
         if not os.path.isfile(path_norm):
@@ -685,29 +812,12 @@ class HikCameraApp:
             self._ng_history_paths.remove(path_norm)
         self._ng_history_paths.insert(0, path_norm)
         del self._ng_history_paths[_NG_HISTORY_MAX :]
-        self._refresh_ng_listbox_ui()
+        self._refresh_ng_list_ui()
         self._persist_ng_history_to_disk()
 
-        lb = self._ng_listbox
-        lb.selection_clear(0, tk.END)
-        lb.selection_set(0)
-        lb.see(0)
-
-    def _on_ng_history_click(self, _event: tk.Event) -> None:
-        lb = getattr(self, "_ng_listbox", None)
-        if lb is None:
-            return
-        sel = lb.curselection()
-        if not sel:
-            return
-        idx = int(sel[0])
-        if idx < 0 or idx >= len(self._ng_history_paths):
-            return
-        path = self._ng_history_paths[idx]
-        if os.path.isfile(path):
-            os.startfile(path)
-        else:
-            messagebox.showwarning("NG", f"文件不存在:\n{path}")
+        canvas = getattr(self, "_ng_list_canvas", None)
+        if canvas is not None:
+            canvas.yview_moveto(0)
 
     def update_status(self, text, color="#ffff00"):
         self.status_label.config(text=f"状态: {text}", fg=color)
@@ -849,21 +959,57 @@ class HikCameraApp:
             return cv2.cvtColor(img_bgr, cv2.COLOR_BGRA2RGB)
         return cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
 
-    def display_ocr_image_from_bgr(self, img_bgr: np.ndarray) -> None:
-        """Show a BGR ndarray in the OCR preview panel (resized for layout)."""
+    def _bgr_to_ocr_panel_photo(self, img_bgr: np.ndarray) -> Optional[ImageTk.PhotoImage]:
+        """Resize BGR for ``ocr_result_label``; returns None if invalid."""
         if img_bgr is None or img_bgr.size == 0:
-            return
+            return None
         if img_bgr.ndim == 2:
             img_bgr = cv2.cvtColor(img_bgr, cv2.COLOR_GRAY2BGR)
+        if img_bgr.ndim != 3 or img_bgr.shape[2] != 3:
+            return None
         img_rgb = self._opencv_bgr_to_display_rgb(img_bgr)
         img_pil = Image.fromarray(img_rgb)
+        display_width = 640
+        display_height = max(1, int(display_width * img_pil.height / img_pil.width))
+        img_pil = img_pil.resize(
+            (display_width, display_height), Image.Resampling.LANCZOS
+        )
+        return ImageTk.PhotoImage(img_pil)
 
-        display_width = 640 if not _SHOW_CAMERA_PREVIEW else 350
-        display_height = int(display_width * img_pil.height / img_pil.width)
-        img_pil = img_pil.resize((display_width, display_height), Image.Resampling.LANCZOS)
+    def _enter_ocr_panel_live_mode(self) -> None:
+        """连接相机后：识别结果框播实时画面（调镜头用）。"""
+        self._ocr_panel_mode = _OCR_PANEL_LIVE
 
-        img_tk = ImageTk.PhotoImage(img_pil)
+    def _enter_ocr_panel_result_mode(self) -> None:
+        """拍照+OCR 或进入硬触发后：停止直播，仅显示 OCR 静图。"""
+        self._ocr_panel_mode = _OCR_PANEL_RESULT
 
+    def _clear_ocr_panel(self) -> None:
+        """断开相机：清空识别结果框。"""
+        self._ocr_panel_mode = _OCR_PANEL_IDLE
+        self._ocr_panel_photo = None
+        self.ocr_result_label.config(image="", text=_OCR_PANEL_IDLE_TEXT)
+        self.ocr_result_label.image = None
+
+    def _apply_live_to_ocr_panel(self, bgr: np.ndarray) -> None:
+        """Tk 主线程：仅在 live 模式下刷新识别结果框。"""
+        if self._ocr_panel_mode != _OCR_PANEL_LIVE:
+            return
+        img_tk = self._bgr_to_ocr_panel_photo(bgr)
+        if img_tk is None:
+            return
+        self._ocr_panel_photo = img_tk
+        self.ocr_result_label.config(image=img_tk, text="")
+        self.ocr_result_label.image = img_tk
+
+    def display_ocr_image_from_bgr(self, img_bgr: np.ndarray) -> None:
+        """在 result 模式下显示 OCR 渲染静图（识别结果框）。"""
+        if self._ocr_panel_mode != _OCR_PANEL_RESULT:
+            return
+        img_tk = self._bgr_to_ocr_panel_photo(img_bgr)
+        if img_tk is None:
+            return
+        self._ocr_panel_photo = img_tk
         self.ocr_result_label.config(image=img_tk, text="")
         self.ocr_result_label.image = img_tk
 
@@ -1691,7 +1837,6 @@ class HikCameraApp:
         frame_bgr: np.ndarray,
         *,
         meta_file: str = "camera_live",
-        update_camera_preview: bool = True,
         increment_manual_capture_counter: bool = False,
         dialog_on_success: bool = False,
         dialog_on_error: bool = True,
@@ -1715,6 +1860,7 @@ class HikCameraApp:
             return False
 
         try:
+            self._enter_ocr_panel_result_mode()
             self._log_decode_path_for_ocr(meta_file)
             frame_bgr = prepare_bgr_for_predict(frame_bgr)
             t0 = time.perf_counter()
@@ -1747,11 +1893,6 @@ class HikCameraApp:
 
             self.current_ocr_result = ocr_data
             self.display_ocr_image_from_bgr(vis_ocr_ui)
-            if update_camera_preview:
-                prev = self._bgr_resize_to_preview(vis_det)
-                self._apply_video_preview(prev)
-                with self.frame_lock:
-                    self.current_frame = prev.copy()
 
             with self._stats_lock:
                 self._ocr_total_count += 1
@@ -1788,7 +1929,6 @@ class HikCameraApp:
         self.run_ocr_pipeline_on_frame(
             bgr,
             meta_file="hardware_trigger",
-            update_camera_preview=True,
             increment_manual_capture_counter=False,
             dialog_on_success=False,
             dialog_on_error=True,
@@ -1848,6 +1988,7 @@ class HikCameraApp:
 
             if want_hw:
                 self.use_hw_trigger = True
+                self._enter_ocr_panel_result_mode()
                 self.btn_toggle_trigger.config(text="切换到连续采集")
                 self.update_status("硬触发: Line0，等待触发脉冲…", "#ffff00")
             else:
@@ -2074,7 +2215,7 @@ class HikCameraApp:
         self.b_start_grabbing = True
         self.grab_thread = threading.Thread(target=self.grab_thread_func, daemon=True)
         self.grab_thread.start()
-        if _SHOW_CAMERA_PREVIEW:
+        if self._ocr_panel_mode == _OCR_PANEL_LIVE:
             try:
                 self.root.after(0, self._pump_preview_queue)
             except Exception:
@@ -2465,35 +2606,34 @@ class HikCameraApp:
         except queue.Empty:
             pass
 
+        self._enter_ocr_panel_live_mode()
         self.grab_thread = threading.Thread(target=self.grab_thread_func, daemon=True)
         self.grab_thread.start()
-        if _SHOW_CAMERA_PREVIEW:
-            self.root.after(0, self._pump_preview_queue)
+        self.root.after(0, self._pump_preview_queue)
         self._snapshot_and_save_camera_config()
 
     def _apply_video_preview(self, bgr: np.ndarray) -> None:
-        """Update camera preview from a BGR image (Tk main thread only)."""
-        if not _SHOW_CAMERA_PREVIEW or self.video_label is None:
+        """Legacy 独立预览面板；当前默认画在 ``ocr_result_label``。"""
+        if _SHOW_CAMERA_PREVIEW and self.video_label is not None:
+            try:
+                if bgr is None or bgr.size == 0:
+                    return
+                if bgr.ndim == 2:
+                    bgr = cv2.cvtColor(bgr, cv2.COLOR_GRAY2BGR)
+                if bgr.ndim != 3 or bgr.shape[2] != 3:
+                    return
+                rgb = self._opencv_bgr_to_display_rgb(bgr)
+                img_pil = Image.fromarray(rgb)
+                img_tk = ImageTk.PhotoImage(img_pil)
+                self._video_preview_photo = img_tk
+                self.video_label.config(image=img_tk, text="")
+            except Exception:
+                pass
             return
-        try:
-            if bgr is None or bgr.size == 0:
-                return
-            if bgr.ndim == 2:
-                bgr = cv2.cvtColor(bgr, cv2.COLOR_GRAY2BGR)
-            if bgr.ndim != 3 or bgr.shape[2] != 3:
-                return
-            rgb = self._opencv_bgr_to_display_rgb(bgr)
-            img_pil = Image.fromarray(rgb)
-            img_tk = ImageTk.PhotoImage(img_pil)
-            self._video_preview_photo = img_tk
-            self.video_label.config(image=img_tk, text="")
-        except Exception:
-            pass
+        self._apply_live_to_ocr_panel(bgr)
 
     def _pump_preview_queue(self) -> None:
         """Drain preview frames on Tk main thread (started from connect, ~30 FPS)."""
-        if not _SHOW_CAMERA_PREVIEW:
-            return
         if self.b_exit:
             return
         last: Optional[np.ndarray] = None
@@ -2503,14 +2643,15 @@ class HikCameraApp:
         except queue.Empty:
             pass
         if last is not None:
-            self._apply_video_preview(last)
+            self._apply_live_to_ocr_panel(last)
         if self.b_start_grabbing and not self.b_exit:
             self.root.after(33, self._pump_preview_queue)
 
     def _schedule_video_preview(self, bgr: np.ndarray) -> None:
-        """Grab thread enqueues BGR preview; main thread pump paints ``video_label``."""
-        if not _SHOW_CAMERA_PREVIEW:
-            return
+        """Grab thread enqueues BGR preview; main thread pump paints识别结果框(live)。"""
+        if self._ocr_panel_mode != _OCR_PANEL_LIVE:
+            if not (_SHOW_CAMERA_PREVIEW and self.video_label is not None):
+                return
         snap = np.ascontiguousarray(bgr).copy()
         try:
             self._preview_queue.put_nowait(snap)
@@ -2612,6 +2753,7 @@ class HikCameraApp:
             messagebox.showerror("错误", msg)
             return
 
+        self._enter_ocr_panel_result_mode()
         self.update_status("正在拍照...", "#ffff00")
         self.root.update()
 
@@ -2630,7 +2772,6 @@ class HikCameraApp:
             self.run_ocr_pipeline_on_frame(
                 frame_bgr,
                 meta_file="camera_live",
-                update_camera_preview=True,
                 increment_manual_capture_counter=True,
                 dialog_on_success=False,
                 dialog_on_error=True,
@@ -2665,6 +2806,7 @@ class HikCameraApp:
         if self.video_label is not None:
             self.video_label.config(image="", text="相机预览区域")
             self.video_label.image = None
+        self._clear_ocr_panel()
 
         self.update_status("相机已断开", "#ffff00")
         self.update_camera_info("相机信息: 未连接")
