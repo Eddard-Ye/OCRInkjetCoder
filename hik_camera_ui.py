@@ -664,16 +664,17 @@ class HikCameraApp:
                     else:
                         continue
                     if p:
-                        paths.append(os.path.normpath(p))
+                        paths.append(p)
             except Exception:
                 paths = []
         seen: set[str] = set()
         unique: List[str] = []
         for p in paths:
-            if p in seen:
+            canon = self._resolve_ng_jpg_path(p)
+            if canon in seen:
                 continue
-            seen.add(p)
-            unique.append(p)
+            seen.add(canon)
+            unique.append(canon)
         self._ng_history_paths = unique[:_NG_HISTORY_MAX]
         self._refresh_ng_list_ui()
 
@@ -682,10 +683,38 @@ class HikCameraApp:
         if canvas is not None and event.delta:
             canvas.yview_scroll(int(-event.delta / 120), "units")
 
+    def _resolve_ng_jpg_path(self, stored_path: str) -> str:
+        """Map list/history path to on-disk ``~/HikCameraPhotos/ng/{ts}_NG.jpg``."""
+        p = os.path.normpath(str(stored_path).strip())
+        if os.path.isfile(p):
+            return p
+        name = os.path.basename(p)
+        if name:
+            cand = os.path.join(self.photo_save_dir_ng, name)
+            if os.path.isfile(cand):
+                return os.path.normpath(cand)
+        return p
+
     @staticmethod
-    def _paired_ng_json_path(image_path: str) -> str:
+    def _paired_ng_json_paths(image_path: str) -> List[str]:
+        """
+        JSON sidecars for NG jpg.
+
+        Save uses ``{ts}_NG.jpg`` + ``{ts}.json``; also try legacy ``{ts}_NG.json``.
+        """
         stem, _ext = os.path.splitext(image_path)
-        return stem + ".json"
+        candidates: List[str] = []
+        if stem.endswith("_NG"):
+            candidates.append(stem[:-3] + ".json")
+        candidates.append(stem + ".json")
+        seen: set[str] = set()
+        out: List[str] = []
+        for c in candidates:
+            c = os.path.normpath(c)
+            if c not in seen:
+                seen.add(c)
+                out.append(c)
+        return out
 
     def _persist_ng_history_to_disk(self) -> None:
         try:
@@ -710,7 +739,7 @@ class HikCameraApp:
 
         row_bg = "#252525"
         row_hover = "#3a2a2a"
-        for idx, path in enumerate(self._ng_history_paths):
+        for path in self._ng_history_paths:
             row = tk.Frame(inner, bg=row_bg)
             row.pack(fill=tk.X, padx=2, pady=1)
 
@@ -730,7 +759,6 @@ class HikCameraApp:
                 self._open_ng_history_path(p)
 
             lbl.bind("<ButtonRelease-1>", _open)
-            row.bind("<ButtonRelease-1>", _open)
 
             def _on_enter(_e: tk.Event, r: tk.Frame = row, lb: tk.Label = lbl) -> None:
                 r.configure(bg=row_hover)
@@ -748,7 +776,7 @@ class HikCameraApp:
             btn_del = tk.Button(
                 row,
                 text="×",
-                command=lambda i=idx: self._delete_ng_history_entry(i),
+                command=lambda p=path: self._delete_ng_history_by_path(p),
                 font=("微软雅黑", 10, "bold"),
                 fg="#ffffff",
                 bg="#8b3030",
@@ -770,42 +798,80 @@ class HikCameraApp:
             canvas.configure(scrollregion=canvas.bbox("all"))
 
     def _open_ng_history_path(self, path: str) -> None:
-        if os.path.isfile(path):
-            os.startfile(path)
+        resolved = self._resolve_ng_jpg_path(path)
+        if os.path.isfile(resolved):
+            os.startfile(resolved)
         else:
-            messagebox.showwarning("NG", f"文件不存在:\n{path}")
+            messagebox.showwarning("NG", f"文件不存在:\n{resolved}")
 
-    def _delete_ng_history_files(self, image_path: str) -> List[str]:
-        """Delete NG jpg and paired json; return list of paths that failed to delete."""
+    def _delete_ng_history_files(
+        self, stored_image_path: str
+    ) -> Tuple[List[str], bool]:
+        """
+        Delete NG jpg and paired json under ``photo_save_dir_ng``.
+
+        Returns:
+            (paths that failed to delete, whether jpg was missing on disk)
+        """
+        jpg = self._resolve_ng_jpg_path(stored_image_path)
+        jpg_missing = not os.path.isfile(jpg)
         failed: List[str] = []
-        for fp in (image_path, self._paired_ng_json_path(image_path)):
-            if not os.path.isfile(fp):
+
+        if not jpg_missing:
+            try:
+                os.remove(jpg)
+            except OSError:
+                failed.append(jpg)
+
+        for jp in self._paired_ng_json_paths(jpg):
+            if not os.path.isfile(jp):
                 continue
             try:
-                os.remove(fp)
+                os.remove(jp)
             except OSError:
-                failed.append(fp)
-        return failed
+                failed.append(jp)
 
-    def _delete_ng_history_entry(self, index: int) -> None:
-        if index < 0 or index >= len(self._ng_history_paths):
+        return failed, jpg_missing
+
+    def _find_ng_history_list_index(self, stored_path: str) -> int:
+        """Match list entry by resolved path or basename."""
+        target = self._resolve_ng_jpg_path(stored_path)
+        t_base = os.path.basename(target).lower()
+        for i, p in enumerate(self._ng_history_paths):
+            if os.path.normpath(p) == os.path.normpath(target):
+                return i
+            if os.path.basename(p).lower() == t_base:
+                return i
+        return -1
+
+    def _delete_ng_history_by_path(self, stored_path: str) -> None:
+        idx = self._find_ng_history_list_index(stored_path)
+        if idx < 0:
             return
-        path = self._ng_history_paths[index]
-        failed = self._delete_ng_history_files(path)
-        del self._ng_history_paths[index]
+        path = self._ng_history_paths[idx]
+        failed, jpg_missing = self._delete_ng_history_files(path)
+        del self._ng_history_paths[idx]
         self._refresh_ng_list_ui()
         self._persist_ng_history_to_disk()
         if failed:
             messagebox.showwarning(
                 "NG",
-                "列表已更新，但以下文件未能删除:\n" + "\n".join(failed),
+                "列表已更新，但以下文件未能删除（可能被占用）:\n"
+                + "\n".join(failed),
             )
+        elif jpg_missing:
+            self.update_status(
+                "NG 条已从列表移除（ng 文件夹中未找到对应图片）",
+                "#ffff00",
+            )
+        else:
+            self.update_status("已删除 NG 记录及对应文件", "#00ff00")
 
     def _register_ng_history(self, path: str, display_name: str) -> None:
         """主线程：将刚落盘的 NG 渲染图加入展示区（最新在顶）并持久化。"""
         if getattr(self, "_ng_list_inner", None) is None:
             return
-        path_norm = os.path.normpath(path)
+        path_norm = self._resolve_ng_jpg_path(path)
         if not os.path.isfile(path_norm):
             return
         if path_norm in self._ng_history_paths:
