@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from datetime import date, timedelta
 from typing import Any, Optional, Sequence
 
-# YYYY.MM.DD / YYYY-MM-DD / YYYY/MM/DD / YYYY��MM��DD��
+# YYYY.MM.DD / YYYY-MM-DD / YYYY/MM/DD / YYYY年MM月DD日
 _DATE_RE = re.compile(
     r"(?P<y>20\d{2})"
     r"(?:[\./\-]|[\u5e74])?"
