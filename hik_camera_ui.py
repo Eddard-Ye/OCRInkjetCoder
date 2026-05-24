@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+import argparse
 import sys
 import os
 
@@ -208,8 +209,31 @@ def _format_genicam_float_for_display(fv: float) -> str:
     return s if s else "0"
 
 
+def _parse_startup_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="海康工业相机 + OCR识别系统")
+    parser.add_argument(
+        "--auto-connect",
+        action="store_true",
+        help="启动后自动连接第一台相机（需与 --hardware-trigger 同时使用）",
+    )
+    parser.add_argument(
+        "--hardware-trigger",
+        action="store_true",
+        help="自动连接后切换到 Line0 硬触发（需与 --auto-connect 同时使用）",
+    )
+    return parser.parse_args(argv)
+
+
 class HikCameraApp:
-    def __init__(self):
+    def __init__(
+        self,
+        *,
+        startup_auto_connect: bool = False,
+        startup_hardware_trigger: bool = False,
+    ):
+        self._startup_auto_connect = startup_auto_connect
+        self._startup_hardware_trigger = startup_hardware_trigger
+
         self.root = tk.Tk()
         self.root.title("海康工业相机 - 实时监控系统")
         self.root.geometry("1100x800")
@@ -595,7 +619,7 @@ class HikCameraApp:
 
         tk.Label(
             ng_frame,
-            text="新 NG 为 时间戳_NG.jpg；点击文件名打开；右侧 × 删除本条及对应照片/JSON",
+            text="新 NG 为 时间戳_NG.jpg；点击文件名打开；右侧 × 仅从列表移除（不删除 ng 文件夹内文件）",
             font=("微软雅黑", 8),
             bg="#1a1a1a",
             fg="#888888",
@@ -695,27 +719,6 @@ class HikCameraApp:
                 return os.path.normpath(cand)
         return p
 
-    @staticmethod
-    def _paired_ng_json_paths(image_path: str) -> List[str]:
-        """
-        JSON sidecars for NG jpg.
-
-        Save uses ``{ts}_NG.jpg`` + ``{ts}.json``; also try legacy ``{ts}_NG.json``.
-        """
-        stem, _ext = os.path.splitext(image_path)
-        candidates: List[str] = []
-        if stem.endswith("_NG"):
-            candidates.append(stem[:-3] + ".json")
-        candidates.append(stem + ".json")
-        seen: set[str] = set()
-        out: List[str] = []
-        for c in candidates:
-            c = os.path.normpath(c)
-            if c not in seen:
-                seen.add(c)
-                out.append(c)
-        return out
-
     def _persist_ng_history_to_disk(self) -> None:
         try:
             payload = {
@@ -804,35 +807,6 @@ class HikCameraApp:
         else:
             messagebox.showwarning("NG", f"文件不存在:\n{resolved}")
 
-    def _delete_ng_history_files(
-        self, stored_image_path: str
-    ) -> Tuple[List[str], bool]:
-        """
-        Delete NG jpg and paired json under ``photo_save_dir_ng``.
-
-        Returns:
-            (paths that failed to delete, whether jpg was missing on disk)
-        """
-        jpg = self._resolve_ng_jpg_path(stored_image_path)
-        jpg_missing = not os.path.isfile(jpg)
-        failed: List[str] = []
-
-        if not jpg_missing:
-            try:
-                os.remove(jpg)
-            except OSError:
-                failed.append(jpg)
-
-        for jp in self._paired_ng_json_paths(jpg):
-            if not os.path.isfile(jp):
-                continue
-            try:
-                os.remove(jp)
-            except OSError:
-                failed.append(jp)
-
-        return failed, jpg_missing
-
     def _find_ng_history_list_index(self, stored_path: str) -> int:
         """Match list entry by resolved path or basename."""
         target = self._resolve_ng_jpg_path(stored_path)
@@ -848,24 +822,10 @@ class HikCameraApp:
         idx = self._find_ng_history_list_index(stored_path)
         if idx < 0:
             return
-        path = self._ng_history_paths[idx]
-        failed, jpg_missing = self._delete_ng_history_files(path)
         del self._ng_history_paths[idx]
         self._refresh_ng_list_ui()
         self._persist_ng_history_to_disk()
-        if failed:
-            messagebox.showwarning(
-                "NG",
-                "列表已更新，但以下文件未能删除（可能被占用）:\n"
-                + "\n".join(failed),
-            )
-        elif jpg_missing:
-            self.update_status(
-                "NG 条已从列表移除（ng 文件夹中未找到对应图片）",
-                "#ffff00",
-            )
-        else:
-            self.update_status("已删除 NG 记录及对应文件", "#00ff00")
+        self.update_status("已从 NG 展示区移除（磁盘文件保留）", "#00ff00")
 
     def _register_ng_history(self, path: str, display_name: str) -> None:
         """主线程：将刚落盘的 NG 渲染图加入展示区（最新在顶）并持久化。"""
@@ -2901,8 +2861,18 @@ class HikCameraApp:
             self.root.destroy()
             sys.exit(0)
 
+    def _startup_auto_connect_and_hw_trigger(self) -> None:
+        """Main-thread startup: connect camera, then switch to Line0 hardware trigger."""
+        self.connect_camera()
+        if not self.b_open_device:
+            return
+        if self._startup_hardware_trigger and not self.use_hw_trigger:
+            self.toggle_hardware_trigger_mode()
+
     def run(self):
         self.update_capture_stats_display()
+        if self._startup_auto_connect:
+            self.root.after(200, self._startup_auto_connect_and_hw_trigger)
         self.root.mainloop()
 
 
@@ -2910,5 +2880,16 @@ if __name__ == "__main__":
     print("=" * 60)
     print("海康工业相机 + OCR识别系统")
     print("=" * 60)
-    app = HikCameraApp()
+    _args = _parse_startup_args()
+    _auto_connect = _args.auto_connect and _args.hardware_trigger
+    _hw_trigger = _auto_connect
+    if (_args.auto_connect or _args.hardware_trigger) and not _auto_connect:
+        print(
+            "提示: --auto-connect 与 --hardware-trigger 需同时使用才会自动连接并切硬触发；"
+            "当前按手动模式启动。"
+        )
+    app = HikCameraApp(
+        startup_auto_connect=_auto_connect,
+        startup_hardware_trigger=_hw_trigger,
+    )
     app.run()
