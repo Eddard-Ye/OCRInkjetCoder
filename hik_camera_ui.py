@@ -482,6 +482,48 @@ class HikCameraApp:
         )
         self.status_label.pack(pady=3)
 
+        # Bottom bar packed before main content so OK/NG stats stay on screen when preview runs.
+        info_frame = tk.Frame(self.root, bg="#2b2b2b")
+        stats_wrap = tk.Frame(info_frame, bg="#2b2b2b")
+        stats_wrap.pack(side="right")
+
+        self.btn_stats_reset = tk.Button(
+            stats_wrap,
+            text="统计清零",
+            command=self._clear_all_stats,
+            font=("微软雅黑", 9),
+            bg="#444444",
+            fg="#ffffff",
+            padx=8,
+            pady=2,
+        )
+        self.btn_stats_reset.pack(side="right", padx=(8, 0))
+
+        self.photo_count_label = tk.Label(
+            stats_wrap,
+            text="拍照+OCR: 0 次  |  硬触发: 0 次\nOCR总计: 0  |  OK: 0  |  NG: 0  |  OK率: 0%  |  NG率: 0%",
+            font=("微软雅黑", 9),
+            bg="#2b2b2b",
+            fg="#aaaaaa",
+            justify=tk.RIGHT,
+            anchor="e",
+        )
+        self.photo_count_label.pack(side="right")
+
+        self.camera_info_label = tk.Label(
+            info_frame,
+            text="相机信息: 未连接",
+            font=("微软雅黑", 9),
+            bg="#2b2b2b",
+            fg="#aaaaaa",
+            anchor="w",
+            justify=tk.LEFT,
+        )
+        self.camera_info_label.pack(side="left", fill="x", expand=True)
+
+        info_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=20, pady=3)
+        info_frame.bind("<Configure>", self._on_info_frame_configure)
+
         main_frame = tk.Frame(self.root, bg="#2b2b2b")
         main_frame.pack(fill="both", expand=True, padx=10, pady=5)
 
@@ -552,44 +594,11 @@ class HikCameraApp:
             ocr_result_frame_nested.pack(fill="both", expand=True, padx=5, pady=5)
             self._pack_ocr_preview_and_ng_panel(ocr_result_frame_nested)
 
-        info_frame = tk.Frame(self.root, bg="#2b2b2b")
-        info_frame.pack(pady=3, fill="x", padx=20)
-
-        self.camera_info_label = tk.Label(
-            info_frame,
-            text="相机信息: 未连接",
-            font=("微软雅黑", 9),
-            bg="#2b2b2b",
-            fg="#aaaaaa",
-            anchor="w"
-        )
-        self.camera_info_label.pack(side="left")
-
-        stats_wrap = tk.Frame(info_frame, bg="#2b2b2b")
-        stats_wrap.pack(side="right")
-
-        self.btn_stats_reset = tk.Button(
-            stats_wrap,
-            text="统计清零",
-            command=self._clear_all_stats,
-            font=("微软雅黑", 9),
-            bg="#444444",
-            fg="#ffffff",
-            padx=8,
-            pady=2,
-        )
-        self.btn_stats_reset.pack(side="right", padx=(8, 0))
-
-        self.photo_count_label = tk.Label(
-            stats_wrap,
-            text="拍照+OCR: 0 次  |  硬触发: 0 次\nOCR总计: 0  |  OK: 0  |  NG: 0  |  OK率: 0%  |  NG率: 0%",
-            font=("微软雅黑", 9),
-            bg="#2b2b2b",
-            fg="#aaaaaa",
-            justify=tk.RIGHT,
-            anchor="e",
-        )
-        self.photo_count_label.pack(side="right")
+    def _on_info_frame_configure(self, event: tk.Event) -> None:
+        """Keep long camera info from overlapping the OK/NG stats on the right."""
+        reserve = 430
+        wrap = max(120, int(event.width) - reserve)
+        self.camera_info_label.config(wraplength=wrap)
 
     def protocol(self):
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
@@ -985,8 +994,19 @@ class HikCameraApp:
             return cv2.cvtColor(img_bgr, cv2.COLOR_BGRA2RGB)
         return cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
 
+    def _ocr_panel_display_bounds(self) -> Tuple[int, int]:
+        """Max preview size inside ``ocr_result_label`` (avoid pushing footer off-screen)."""
+        self.root.update_idletasks()
+        w = int(self.ocr_result_label.winfo_width())
+        h = int(self.ocr_result_label.winfo_height())
+        if w <= 1:
+            w = 640
+        if h <= 1:
+            h = 320
+        return max(160, w - 12), max(120, h - 12)
+
     def _bgr_to_ocr_panel_photo(self, img_bgr: np.ndarray) -> Optional[ImageTk.PhotoImage]:
-        """Resize BGR for ``ocr_result_label``; returns None if invalid."""
+        """Resize BGR to fit ``ocr_result_label``; returns None if invalid."""
         if img_bgr is None or img_bgr.size == 0:
             return None
         if img_bgr.ndim == 2:
@@ -995,8 +1015,10 @@ class HikCameraApp:
             return None
         img_rgb = self._opencv_bgr_to_display_rgb(img_bgr)
         img_pil = Image.fromarray(img_rgb)
-        display_width = 640
-        display_height = max(1, int(display_width * img_pil.height / img_pil.width))
+        max_w, max_h = self._ocr_panel_display_bounds()
+        scale = min(max_w / img_pil.width, max_h / img_pil.height)
+        display_width = max(1, int(img_pil.width * scale))
+        display_height = max(1, int(img_pil.height * scale))
         img_pil = img_pil.resize(
             (display_width, display_height), Image.Resampling.LANCZOS
         )
@@ -1084,7 +1106,7 @@ class HikCameraApp:
         """Hook: invoked when required label phrases are not all found in ``boxes``."""
         try:
             self.relay_controller.turn_on(1)
-            time.sleep(0.5)
+            time.sleep(0.3)
             self.relay_controller.turn_off(1)
         except Exception as e:
             messagebox.showwarning("继电器", f"继电器动作失败: {e}")
