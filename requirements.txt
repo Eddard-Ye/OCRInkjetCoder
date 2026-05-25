@@ -2,6 +2,7 @@
 numpy
 opencv-python
 Pillow
+cryptography
 
 # Paddle: full-image det (paddlex) + strip OCR (paddleocr)
 paddlepaddle

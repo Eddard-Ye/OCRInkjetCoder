@@ -39,6 +39,7 @@ from production_phrase_strategy import (
     ColonCjkPhraseMatchStrategy,
     StrictExclusiveSubstringStrategy,
 )
+import license_manager
 
 _PRODUCTION_STRATEGY_STRICT = "StrictExclusiveSubstringStrategy"
 _PRODUCTION_STRATEGY_COLON_CJK = "ColonCjkPhraseMatchStrategy"
@@ -325,14 +326,30 @@ class HikCameraApp:
         self._last_pixel_type: int = 0
         self._last_sdk_convert_ret: int = 0
         self._last_sdk_convert_stage: str = ""
+        self._license_info: Optional[license_manager.LicenseInfo] = None
 
         self.setup_ui()
         self.protocol()
         self._load_stats_from_disk()
         self._load_ng_history_from_disk()
         self._init_ocr_engine()
+        try:
+            self._license_info = license_manager.check_license()
+        except license_manager.LicenseError:
+            self._license_info = None
 
     def setup_ui(self):
+        self.license_runtime_label = tk.Label(
+            self.root,
+            text="",
+            font=("微软雅黑", 11, "bold"),
+            bg="#2b2b2b",
+            fg="#ffcc66",
+            anchor="e",
+            justify=tk.RIGHT,
+        )
+        self.license_runtime_label.place(relx=1.0, x=-14, y=10, anchor="ne")
+
         title_label = tk.Label(
             self.root,
             text="海康工业相机 + OCR识别系统",
@@ -521,8 +538,20 @@ class HikCameraApp:
         )
         self.camera_info_label.pack(side="left", fill="x", expand=True)
 
+        self.license_info_label = tk.Label(
+            info_frame,
+            text="",
+            font=("微软雅黑", 8),
+            bg="#2b2b2b",
+            fg="#666666",
+            anchor="w",
+        )
+        self.license_info_label.pack(side="left", padx=(12, 0))
+
         info_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=20, pady=3)
         info_frame.bind("<Configure>", self._on_info_frame_configure)
+        self._refresh_license_display()
+        self._schedule_license_display_refresh()
 
         main_frame = tk.Frame(self.root, bg="#2b2b2b")
         main_frame.pack(fill="both", expand=True, padx=10, pady=5)
@@ -599,6 +628,65 @@ class HikCameraApp:
         reserve = 430
         wrap = max(120, int(event.width) - reserve)
         self.camera_info_label.config(wraplength=wrap)
+
+    def _refresh_license_display(self) -> None:
+        runtime_lbl = getattr(self, "license_runtime_label", None)
+        info_lbl = getattr(self, "license_info_label", None)
+        info = self._license_info
+        if info is None:
+            try:
+                info = license_manager.check_license()
+                self._license_info = info
+            except license_manager.LicenseError:
+                if runtime_lbl is not None:
+                    runtime_lbl.config(
+                        text="可运行时间：未授权",
+                        fg="#ff6666",
+                    )
+                if info_lbl is not None:
+                    info_lbl.config(
+                        text=f"机器码: {license_manager.get_machine_id()}"
+                    )
+                return
+        if runtime_lbl is not None:
+            if info.is_permanent:
+                fg = "#66ff99"
+            elif info.hours_remaining <= 168:
+                fg = "#ff9966"
+            else:
+                fg = "#ffcc66"
+            runtime_lbl.config(
+                text=license_manager.format_runtime_remaining(info),
+                fg=fg,
+            )
+        if info_lbl is not None:
+            info_lbl.config(text=f"机器码: {info.machine_id}")
+
+    def _schedule_license_display_refresh(self) -> None:
+        """Refresh remaining-hours label every minute."""
+        if self.b_exit:
+            return
+        try:
+            self._refresh_license_display()
+        except Exception:
+            pass
+        try:
+            self.root.after(60_000, self._schedule_license_display_refresh)
+        except Exception:
+            pass
+
+    def _require_valid_license(self, *, action: str = "操作") -> bool:
+        try:
+            self._license_info = license_manager.check_license()
+            self._refresh_license_display()
+            return True
+        except license_manager.LicenseError as e:
+            messagebox.showerror(
+                "软件授权",
+                f"{action}被拒绝:\n\n{e}",
+            )
+            self._refresh_license_display()
+            return False
 
     def protocol(self):
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
@@ -2568,6 +2656,8 @@ class HikCameraApp:
         return self.device_list.nDeviceNum > 0
 
     def connect_camera(self):
+        if not self._require_valid_license(action="连接相机"):
+            return
         self.update_status("正在枚举设备...", "#ffff00")
         self.root.update()
 
@@ -2898,10 +2988,29 @@ class HikCameraApp:
         self.root.mainloop()
 
 
+def _startup_license_gate() -> None:
+    """Verify license before Tk main window; exit on failure."""
+    if os.environ.get(license_manager._SKIP_ENV, "").strip().lower() in (  # noqa: SLF001
+        "1",
+        "true",
+        "yes",
+    ):
+        return
+    try:
+        license_manager.check_license()
+    except license_manager.LicenseError as e:
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showerror("软件授权", str(e))
+        root.destroy()
+        sys.exit(1)
+
+
 if __name__ == "__main__":
     print("=" * 60)
     print("海康工业相机 + OCR识别系统")
     print("=" * 60)
+    _startup_license_gate()
     _args = _parse_startup_args()
     _auto_connect = _args.auto_connect and _args.hardware_trigger
     _hw_trigger = _auto_connect
