@@ -33,11 +33,16 @@ from paddle_full_image_detect import (
     resolve_paddle_device,
 )
 from relay_controller import RelayController
-from date_check_config import DateCheckGlobalConfig, validate_shelf_life_dates
+from date_check_config import (
+    DateCheckGlobalConfig,
+    validate_shelf_life_dates_detail,
+)
 from production_phrase_strategy import (
     ColonCjkPhraseMatchStrategy,
+    DEFAULT_REQUIRED_PHRASES,
     StrictExclusiveSubstringStrategy,
 )
+import license_manager
 
 _PRODUCTION_STRATEGY_STRICT = "StrictExclusiveSubstringStrategy"
 _PRODUCTION_STRATEGY_COLON_CJK = "ColonCjkPhraseMatchStrategy"
@@ -301,14 +306,30 @@ class HikCameraApp:
         self._last_pixel_type: int = 0
         self._last_sdk_convert_ret: int = 0
         self._last_sdk_convert_stage: str = ""
+        self._license_info: Optional[license_manager.LicenseInfo] = None
 
         self.setup_ui()
         self.protocol()
         self._load_stats_from_disk()
         self._load_ng_history_from_disk()
         self._init_ocr_engine()
+        try:
+            self._license_info = license_manager.check_license()
+        except license_manager.LicenseError:
+            self._license_info = None
 
     def setup_ui(self):
+        self.license_runtime_label = tk.Label(
+            self.root,
+            text="",
+            font=("微软雅黑", 11, "bold"),
+            bg="#2b2b2b",
+            fg="#ffcc66",
+            anchor="e",
+            justify=tk.RIGHT,
+        )
+        self.license_runtime_label.place(relx=1.0, x=-14, y=10, anchor="ne")
+
         title_label = tk.Label(
             self.root,
             text="海康工业相机 + OCR识别系统",
@@ -541,6 +562,16 @@ class HikCameraApp:
         )
         self.camera_info_label.pack(side="left")
 
+        self.license_info_label = tk.Label(
+            info_frame,
+            text="",
+            font=("微软雅黑", 8),
+            bg="#2b2b2b",
+            fg="#666666",
+            anchor="w",
+        )
+        self.license_info_label.pack(side="left", padx=(12, 0))
+
         stats_wrap = tk.Frame(info_frame, bg="#2b2b2b")
         stats_wrap.pack(side="right")
 
@@ -566,6 +597,70 @@ class HikCameraApp:
             anchor="e",
         )
         self.photo_count_label.pack(side="right")
+        self._refresh_license_display()
+        self._schedule_license_display_refresh()
+
+    def _refresh_license_display(self) -> None:
+        runtime_lbl = getattr(self, "license_runtime_label", None)
+        info_lbl = getattr(self, "license_info_label", None)
+        info = self._license_info
+        if info is None:
+            try:
+                info = license_manager.check_license()
+                self._license_info = info
+            except license_manager.LicenseError:
+                if runtime_lbl is not None:
+                    runtime_lbl.config(
+                        text="\u53ef\u8fd0\u884c\u65f6\u95f4\uff1a\u672a\u6388\u6743",
+                        fg="#ff6666",
+                    )
+                if info_lbl is not None:
+                    info_lbl.config(
+                        text=f"\u673a\u5668\u7801: {license_manager.get_machine_id()}"
+                    )
+                return
+        if runtime_lbl is not None:
+            if info.is_permanent:
+                fg = "#66ff99"
+            elif info.hours_remaining <= 168:
+                fg = "#ff9966"
+            else:
+                fg = "#ffcc66"
+            runtime_lbl.config(
+                text=license_manager.format_runtime_remaining(info),
+                fg=fg,
+            )
+        if info_lbl is not None:
+            info_lbl.config(text=f"\u673a\u5668\u7801: {info.machine_id}")
+
+    def _schedule_license_display_refresh(self) -> None:
+        """Refresh remaining-hours label every minute."""
+        if self.b_exit:
+            return
+        try:
+            self._refresh_license_display()
+        except Exception:
+            pass
+        try:
+            self.root.after(60_000, self._schedule_license_display_refresh)
+        except Exception:
+            pass
+
+    def _refresh_license_status_label(self) -> None:
+        self._refresh_license_display()
+
+    def _require_valid_license(self, *, action: str = "\u64cd\u4f5c") -> bool:
+        try:
+            self._license_info = license_manager.check_license()
+            self._refresh_license_display()
+            return True
+        except license_manager.LicenseError as e:
+            messagebox.showerror(
+                "\u8f6f\u4ef6\u6388\u6743",
+                f"{action}\u88ab\u62d2\u7edd:\n\n{e}",
+            )
+            self._refresh_license_display()
+            return False
 
     def protocol(self):
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
@@ -969,6 +1064,35 @@ class HikCameraApp:
         file_name = ocr_data.get("file", "unknown")
         mode = ocr_data.get("mode", "unknown")
         infer_time = ocr_data.get("infer_seconds", 0)
+        pass_check = bool(ocr_data.get("required_phrases_pass", False))
+        ng_reasons = ocr_data.get("ng_reasons") or []
+
+        if not pass_check:
+            self.result_text.insert(tk.END, "【判定】NG\n", "ng_title")
+            if ng_reasons:
+                self.result_text.insert(tk.END, "NG 原因:\n", "ng_head")
+                for i, reason in enumerate(ng_reasons, 1):
+                    self.result_text.insert(
+                        tk.END, f"  {i}. {reason}\n", "ng_reason"
+                    )
+            else:
+                self.result_text.insert(
+                    tk.END, "  （未记录具体原因）\n", "ng_reason"
+                )
+            self.result_text.insert(tk.END, "-" * 30 + "\n\n")
+        else:
+            self.result_text.insert(tk.END, "【判定】OK\n", "ok_title")
+
+        self.result_text.tag_config(
+            "ng_title", foreground="#ff4444", font=("微软雅黑", 11, "bold")
+        )
+        self.result_text.tag_config(
+            "ng_head", foreground="#ff8888", font=("微软雅黑", 10, "bold")
+        )
+        self.result_text.tag_config("ng_reason", foreground="#ffaaaa")
+        self.result_text.tag_config(
+            "ok_title", foreground="#66ff99", font=("微软雅黑", 11, "bold")
+        )
 
         self.result_text.insert(tk.END, f"文件: {file_name}\n")
         self.result_text.insert(tk.END, f"模式: {mode}\n")
@@ -1420,23 +1544,59 @@ class HikCameraApp:
             pady=4,
         ).pack(side=tk.LEFT, padx=6)
 
-    def check_required_production_expiry_boxes(self, boxes: list[dict]) -> bool:
+    def _phrase_strategy_ng_reasons(
+        self, texts: list[str], strategy: Any
+    ) -> list[str]:
+        """Human-readable NG hints when ``strategy.match`` is False."""
+        if strategy.match(texts):
+            return []
+        name = type(strategy).__name__
+        phrases = getattr(strategy, "phrases", DEFAULT_REQUIRED_PHRASES)
+        missing = [p for p in phrases if not any(p in t for t in texts)]
+        if missing:
+            joined = "\u3001".join(missing)
+            return [
+                f"\u4ea7\u7ebf/\u4fdd\u8d28\u671f\u7b56\u7565({name})\uff1a"
+                f"\u672a\u5339\u914d\u5230\u5fc5\u987b\u77ed\u8bed {joined}"
+            ]
+        return [
+            f"\u4ea7\u7ebf/\u4fdd\u8d28\u671f\u7b56\u7565({name})\uff1a"
+            "\u5173\u952e\u5b57\u53ef\u80fd\u5df2\u51fa\u73b0\uff0c"
+            "\u4f46\u672a\u6ee1\u8db3\u4e92\u65a5/\u5192\u53f7CJK\u957f\u5ea6/LCS/"
+            "\u5e74\u4efd\u7b49\u89c4\u5219"
+        ]
+
+    def check_required_production_expiry_boxes(
+        self, boxes: list[dict]
+    ) -> Tuple[bool, List[str]]:
         """
         下拉策略三语校验 + 可选日期检测（``_date_check_config``）。
 
-        通过返回 True；未通过则 :meth:`callRelayAction` 并返回 False。
+        Returns:
+            (pass, ng_reasons) — ``ng_reasons`` empty when pass is True.
         """
         texts = [str(b.get("text", "") or "") for b in boxes]
         cfg = self._date_check_config
         strategy = self._active_production_strategy()
+        ng_reasons: List[str] = []
 
         if not strategy.match(texts):
-            self.callRelayAction()
-            return False
+            ng_reasons.extend(self._phrase_strategy_ng_reasons(texts, strategy))
 
-        if cfg.enable_date_check and not validate_shelf_life_dates(texts, cfg):
+        if cfg.enable_date_check:
+            date_ok, date_reason = validate_shelf_life_dates_detail(texts, cfg)
+            if not date_ok and date_reason:
+                ng_reasons.append(date_reason)
+
+        if ng_reasons:
             self.callRelayAction()
-            return False
+            print(
+                "[HikCameraApp] ocr_check NG "
+                f"strategy={type(strategy).__name__} "
+                f"reasons={ng_reasons!r}",
+                flush=True,
+            )
+            return False, ng_reasons
 
         print(
             "[HikCameraApp] ocr_check pass "
@@ -1446,7 +1606,7 @@ class HikCameraApp:
             f"shelf_life_frozen={cfg.shelf_life_frozen}",
             flush=True,
         )
-        return True
+        return True, []
 
     def _trigger_sdk_ints(self) -> Tuple[int, int, int]:
         """TriggerMode / TriggerSource ints from MVS headers (with safe fallbacks)."""
@@ -1822,6 +1982,7 @@ class HikCameraApp:
             "mode": ocr_data.get("mode"),
             "infer_seconds": float(ocr_data.get("infer_seconds") or 0.0),
             "required_phrases_pass": bool(ocr_data.get("required_phrases_pass")),
+            "ng_reasons": list(ocr_data.get("ng_reasons") or []),
             "paddle_raw_rec_count": ocr_data.get("paddle_raw_rec_count"),
             "paddle_boxes_after_filter": ocr_data.get("paddle_boxes_after_filter"),
             "boxes": rows,
@@ -1933,7 +2094,9 @@ class HikCameraApp:
             boxes, paddle_debug = predict_boxes(
                 self.ocr_engine, frame_bgr, return_debug=True
             )
-            pass_check = self.check_required_production_expiry_boxes(boxes)
+            pass_check, ng_reasons = self.check_required_production_expiry_boxes(
+                boxes
+            )
             infer_s = time.perf_counter() - t0
 
             ocr_data = {
@@ -1942,6 +2105,7 @@ class HikCameraApp:
                 "mode": "paddle_full_image_detect.predict_boxes",
                 "infer_seconds": float(infer_s),
                 "required_phrases_pass": pass_check,
+                "ng_reasons": ng_reasons,
                 "paddle_raw_rec_count": paddle_debug.get("raw_rec_count"),
                 "paddle_boxes_after_filter": paddle_debug.get("boxes_after_filter"),
             }
@@ -1976,7 +2140,18 @@ class HikCameraApp:
             text_summary = f"合法文本框 {n} 个"
             if long_texts:
                 text_summary += f"（列表中长度>=2 的共 {len(long_texts)} 个）"
-            self.update_status(f"✅ OCR 完成 — {text_summary}", "#00ff00")
+            if pass_check:
+                self.update_status(f"✅ OCR 完成 — OK — {text_summary}", "#00ff00")
+            else:
+                reason_short = (
+                    ng_reasons[0] if ng_reasons else "\u6821\u9a8c\u672a\u901a\u8fc7"
+                )
+                if len(reason_short) > 48:
+                    reason_short = reason_short[:48] + "…"
+                self.update_status(
+                    f"❌ OCR 完成 — NG — {reason_short}",
+                    "#ff6666",
+                )
             if dialog_on_success:
                 messagebox.showinfo(
                     "成功",
@@ -2586,6 +2761,8 @@ class HikCameraApp:
         return self.device_list.nDeviceNum > 0
 
     def connect_camera(self):
+        if not self._require_valid_license(action="\u8fde\u63a5\u76f8\u673a"):
+            return
         self.update_status("正在枚举设备...", "#ffff00")
         self.root.update()
 
@@ -2906,9 +3083,28 @@ class HikCameraApp:
         self.root.mainloop()
 
 
+def _startup_license_gate() -> None:
+    """Verify license before Tk main window; exit on failure."""
+    if os.environ.get(license_manager._SKIP_ENV, "").strip().lower() in (  # noqa: SLF001
+        "1",
+        "true",
+        "yes",
+    ):
+        return
+    try:
+        license_manager.check_license()
+    except license_manager.LicenseError as e:
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showerror("\u8f6f\u4ef6\u6388\u6743", str(e))
+        root.destroy()
+        sys.exit(1)
+
+
 if __name__ == "__main__":
     print("=" * 60)
     print("海康工业相机 + OCR识别系统")
     print("=" * 60)
+    _startup_license_gate()
     app = HikCameraApp()
     app.run()

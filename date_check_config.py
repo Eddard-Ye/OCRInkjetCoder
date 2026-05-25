@@ -91,11 +91,47 @@ def validate_shelf_life_dates(
     texts: Sequence[str],
     cfg: DateCheckGlobalConfig,
 ) -> bool:
+    ok, _reason = validate_shelf_life_dates_detail(texts, cfg)
+    return ok
+
+
+def validate_shelf_life_dates_detail(
+    texts: Sequence[str],
+    cfg: DateCheckGlobalConfig,
+) -> tuple[bool, str]:
+    """Return (pass, reason). ``reason`` is empty when pass is True."""
     prod = _line_date_for_keyword(texts, _KEY_PRODUCTION)
+    if prod is None:
+        return False, "\u65e5\u671f\u68c0\u6d4b\uff1a\u672a\u8bc6\u522b\u5230\u300c\u751f\u4ea7\u65e5\u671f\u300d\u6216\u65e0\u6709\u6548\u65e5\u671f"
+
     normal_exp = _line_date_for_keyword(texts, _KEY_NORMAL)
+    if normal_exp is None:
+        return (
+            False,
+            "\u65e5\u671f\u68c0\u6d4b\uff1a\u672a\u8bc6\u522b\u5230\u542b\u300c\u5e38\u6e29\u300d\u7684\u4fdd\u8d28\u671f\u884c\u6216\u65e0\u6709\u6548\u65e5\u671f",
+        )
+
     frozen_exp = _line_date_for_keyword(texts, _KEY_FROZEN)
-    if prod is None or normal_exp is None or frozen_exp is None:
-        return False
+    if frozen_exp is None:
+        return (
+            False,
+            "\u65e5\u671f\u68c0\u6d4b\uff1a\u672a\u8bc6\u522b\u5230\u542b\u300c\u51b7\u51bb\u300d\u7684\u4fdd\u8d28\u671f\u884c\u6216\u65e0\u6709\u6548\u65e5\u671f",
+        )
+
     expect_normal = prod + timedelta(days=int(cfg.shelf_life_normal))
+    if normal_exp != expect_normal:
+        return (
+            False,
+            "\u65e5\u671f\u68c0\u6d4b\uff1a\u5e38\u6e29\u4fdd\u8d28\u671f\u5e94\u4e3a "
+            f"{expect_normal.isoformat()}\uff0c\u8bc6\u522b\u4e3a {normal_exp.isoformat()}",
+        )
+
     expect_frozen = prod + timedelta(days=int(cfg.shelf_life_frozen))
-    return normal_exp == expect_normal and frozen_exp == expect_frozen
+    if frozen_exp != expect_frozen:
+        return (
+            False,
+            "\u65e5\u671f\u68c0\u6d4b\uff1a\u51b7\u51bb\u4fdd\u8d28\u671f\u5e94\u4e3a "
+            f"{expect_frozen.isoformat()}\uff0c\u8bc6\u522b\u4e3a {frozen_exp.isoformat()}",
+        )
+
+    return True, ""

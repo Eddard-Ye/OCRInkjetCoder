@@ -28,4 +28,5 @@ function Initialize-CondaForSession {
 Initialize-CondaForSession
 conda activate OCRInkjetCoderV2
 Set-Location "D:\SDE\OCRInkjetCoder_V3"
+python -m pip install -q cryptography
 python "D:\SDE\OCRInkjetCoder_V3\hik_camera_ui.py"

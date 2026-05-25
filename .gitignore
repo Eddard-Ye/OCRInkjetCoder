@@ -8,3 +8,5 @@ all_det_json/
 model/
 outputs_loose/
 outputs_sam_label/
+license_keys/
+license.lic
