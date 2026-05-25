@@ -34,7 +34,8 @@ from paddle_full_image_detect import (
     resolve_paddle_device,
 )
 from relay_controller import RelayController
-from date_check_config import DateCheckGlobalConfig, validate_shelf_life_dates
+from date_check_config import DateCheckGlobalConfig
+from ocr_check_report import build_ocr_check_report, format_check_report_for_ui
 from production_phrase_strategy import (
     ColonCjkPhraseMatchStrategy,
     StrictExclusiveSubstringStrategy,
@@ -120,8 +121,8 @@ _OCR_PANEL_LIVE = "live"
 _OCR_PANEL_RESULT = "result"
 _OCR_PANEL_IDLE_TEXT = "请连接相机（连接后显示实时画面，便于调镜头）"
 
-# NG 展示区保留的最近条目数（新 NG 插在列表顶部）。
-_NG_HISTORY_MAX = 80
+# NG 展示区保留的最近条目数（新 NG 插在列表顶部，超出则丢弃最旧）。
+_NG_HISTORY_MAX = 20
 
 # OCR / 拍照时打印最近一次解码路径（sdk / opencv_bayer / packed_*）。
 _LOG_DECODE_PATH_ON_OCR = True
@@ -298,19 +299,12 @@ class HikCameraApp:
 
         self._date_check_config = DateCheckGlobalConfig.load(_DATE_CHECK_CONFIG_PATH)
 
-        self._strict_strategy_cfg: Dict[str, Any] = {"strict_year_suffix": False}
         self._colon_cjk_strategy_cfg: Dict[str, Any] = {
-            "exclude_lines_without_year": False,
             "max_cjk_length_diff": 2,
             "min_cjk_lcs_matches": 3,
         }
-        self._strategy_strict = StrictExclusiveSubstringStrategy(
-            strict_year_suffix=self._strict_strategy_cfg["strict_year_suffix"],
-        )
+        self._strategy_strict = StrictExclusiveSubstringStrategy()
         self._strategy_colon_cjk = ColonCjkPhraseMatchStrategy(
-            exclude_lines_without_year=self._colon_cjk_strategy_cfg[
-                "exclude_lines_without_year"
-            ],
             max_cjk_length_diff=self._colon_cjk_strategy_cfg["max_cjk_length_diff"],
             min_cjk_lcs_matches=self._colon_cjk_strategy_cfg["min_cjk_lcs_matches"],
         )
@@ -327,6 +321,8 @@ class HikCameraApp:
         self._last_sdk_convert_ret: int = 0
         self._last_sdk_convert_stage: str = ""
         self._license_info: Optional[license_manager.LicenseInfo] = None
+
+        self._last_check_report: Optional[Dict[str, Any]] = None
 
         self.setup_ui()
         self.protocol()
@@ -467,17 +463,6 @@ class HikCameraApp:
             values=(_PRODUCTION_STRATEGY_STRICT, _PRODUCTION_STRATEGY_COLON_CJK),
         )
         self._combo_production_strategy.pack(side=tk.LEFT, padx=4)
-
-        tk.Button(
-            strat_frame,
-            text="编辑 Strict 配置",
-            command=self._open_strict_strategy_config_dialog,
-            font=("微软雅黑", 9),
-            bg="#37474f",
-            fg="#ffffff",
-            padx=8,
-            pady=2,
-        ).pack(side=tk.LEFT, padx=(12, 4))
 
         tk.Button(
             strat_frame,
@@ -714,16 +699,29 @@ class HikCameraApp:
         )
         ng_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=5, pady=(0, 5))
 
+        ng_header = tk.Frame(ng_frame, bg="#1a1a1a")
+        ng_header.pack(fill=tk.X, padx=6, pady=(4, 2))
+
+        self._ng_history_count_label = tk.Label(
+            ng_header,
+            text=f"0/{_NG_HISTORY_MAX}",
+            font=("微软雅黑", 9, "bold"),
+            bg="#1a1a1a",
+            fg="#ff9999",
+            anchor="e",
+        )
+        self._ng_history_count_label.pack(side=tk.RIGHT)
+
         tk.Label(
-            ng_frame,
+            ng_header,
             text="新 NG 为 时间戳_NG.jpg；点击文件名打开；右侧 × 仅从列表移除（不删除 ng 文件夹内文件）",
             font=("微软雅黑", 8),
             bg="#1a1a1a",
             fg="#888888",
             anchor="w",
-            wraplength=520,
+            wraplength=480,
             justify="left",
-        ).pack(fill="x", padx=6, pady=(4, 2))
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True)
 
         list_wrap = tk.Frame(ng_frame, bg="#1a1a1a")
         list_wrap.pack(fill=tk.BOTH, expand=True, padx=4, pady=(0, 4))
@@ -830,6 +828,12 @@ class HikCameraApp:
         except Exception:
             pass
 
+    def _update_ng_history_count_label(self) -> None:
+        lbl = getattr(self, "_ng_history_count_label", None)
+        if lbl is not None:
+            n = len(self._ng_history_paths)
+            lbl.config(text=f"{n}/{_NG_HISTORY_MAX}")
+
     def _refresh_ng_list_ui(self) -> None:
         inner = getattr(self, "_ng_list_inner", None)
         if inner is None:
@@ -896,6 +900,7 @@ class HikCameraApp:
         if canvas is not None:
             canvas.update_idletasks()
             canvas.configure(scrollregion=canvas.bbox("all"))
+        self._update_ng_history_count_label()
 
     def _open_ng_history_path(self, path: str) -> None:
         resolved = self._resolve_ng_jpg_path(path)
@@ -1061,6 +1066,17 @@ class HikCameraApp:
             self.result_text.insert(tk.END, f"  {i}. {text}\n", "cyan")
         self.result_text.tag_config("cyan", foreground="#00ffff")
 
+        check_report = ocr_data.get("check_report")
+        if check_report:
+            block = format_check_report_for_ui(check_report)
+            verdict = str(check_report.get("verdict", ""))
+            tag = "ok_verdict" if verdict == "OK" else "ng_verdict"
+            self.result_text.insert(tk.END, "\n" + block + "\n", tag)
+            color = "#66ff66" if verdict == "OK" else "#ff6666"
+            self.result_text.tag_config(
+                tag, foreground=color, font=("微软雅黑", 9, "bold")
+            )
+
         return long_texts
 
     def display_ocr_image(self, image_path):
@@ -1207,74 +1223,13 @@ class HikCameraApp:
             cfg = dict(self._colon_cjk_strategy_cfg)
         else:
             strat = self._strategy_strict
-            cfg = dict(self._strict_strategy_cfg)
+            cfg = {}
         print(
             "[HikCameraApp] active_production_strategy "
             f"combo={name!r} class={type(strat).__name__} config={cfg!r}",
             flush=True,
         )
         return strat
-
-    def _open_strict_strategy_config_dialog(self) -> None:
-        top = tk.Toplevel(self.root)
-        top.title("StrictExclusiveSubstringStrategy")
-        top.configure(bg="#2b2b2b")
-        top.transient(self.root)
-        top.grab_set()
-
-        var = tk.BooleanVar(
-            value=bool(self._strict_strategy_cfg.get("strict_year_suffix", False))
-        )
-        tk.Label(
-            top,
-            text="严格子串（三行互斥）参数",
-            font=("微软雅黑", 11, "bold"),
-            bg="#2b2b2b",
-            fg="#00ff00",
-        ).pack(anchor="w", padx=12, pady=(10, 4))
-
-        tk.Checkbutton(
-            top,
-            text="strict_year_suffix：排除整行不含今年数字(如2026)子串的行",
-            variable=var,
-            font=("微软雅黑", 9),
-            bg="#2b2b2b",
-            fg="#eeeeee",
-            selectcolor="#444444",
-            activebackground="#2b2b2b",
-            activeforeground="#ffffff",
-        ).pack(anchor="w", padx=12, pady=6)
-
-        btn_row = tk.Frame(top, bg="#2b2b2b")
-        btn_row.pack(pady=14)
-
-        def on_ok() -> None:
-            self._strict_strategy_cfg["strict_year_suffix"] = bool(var.get())
-            self._strategy_strict = StrictExclusiveSubstringStrategy(
-                strict_year_suffix=self._strict_strategy_cfg["strict_year_suffix"],
-            )
-            top.destroy()
-
-        tk.Button(
-            btn_row,
-            text="确定",
-            command=on_ok,
-            font=("微软雅黑", 9),
-            bg="#4CAF50",
-            fg="white",
-            padx=14,
-            pady=4,
-        ).pack(side=tk.LEFT, padx=6)
-        tk.Button(
-            btn_row,
-            text="取消",
-            command=top.destroy,
-            font=("微软雅黑", 9),
-            bg="#666666",
-            fg="white",
-            padx=14,
-            pady=4,
-        ).pack(side=tk.LEFT, padx=6)
 
     def _open_colon_cjk_strategy_config_dialog(self) -> None:
         top = tk.Toplevel(self.root)
@@ -1284,7 +1239,6 @@ class HikCameraApp:
         top.grab_set()
 
         cfg = self._colon_cjk_strategy_cfg
-        var_year = tk.BooleanVar(value=bool(cfg.get("exclude_lines_without_year", False)))
         var_x = tk.StringVar(value=str(int(cfg.get("max_cjk_length_diff", 2))))
         var_y = tk.StringVar(value=str(int(cfg.get("min_cjk_lcs_matches", 3))))
 
@@ -1295,18 +1249,6 @@ class HikCameraApp:
             bg="#2b2b2b",
             fg="#00ff00",
         ).pack(anchor="w", padx=12, pady=(10, 4))
-
-        tk.Checkbutton(
-            top,
-            text="exclude_lines_without_year：同 Strict（行内须含今年数字子串）",
-            variable=var_year,
-            font=("微软雅黑", 9),
-            bg="#2b2b2b",
-            fg="#eeeeee",
-            selectcolor="#444444",
-            activebackground="#2b2b2b",
-            activeforeground="#ffffff",
-        ).pack(anchor="w", padx=12, pady=4)
 
         row_x = tk.Frame(top, bg="#2b2b2b")
         row_x.pack(fill="x", padx=12, pady=4)
@@ -1351,15 +1293,9 @@ class HikCameraApp:
             if xd < 0 or yd < 0:
                 messagebox.showerror("错误", "x / y 须 >= 0", parent=top)
                 return
-            self._colon_cjk_strategy_cfg["exclude_lines_without_year"] = bool(
-                var_year.get()
-            )
             self._colon_cjk_strategy_cfg["max_cjk_length_diff"] = xd
             self._colon_cjk_strategy_cfg["min_cjk_lcs_matches"] = yd
             self._strategy_colon_cjk = ColonCjkPhraseMatchStrategy(
-                exclude_lines_without_year=self._colon_cjk_strategy_cfg[
-                    "exclude_lines_without_year"
-                ],
                 max_cjk_length_diff=xd,
                 min_cjk_lcs_matches=yd,
             )
@@ -1418,6 +1354,16 @@ class HikCameraApp:
             activebackground="#2b2b2b",
             activeforeground="#ffffff",
         ).pack(anchor="w", padx=14, pady=6)
+
+        tk.Label(
+            top,
+            text="启用后：须有三行 OCR 文本分别解析为「今天 / 今天+常温天数 / 今天+冷冻天数」",
+            font=("微软雅黑", 8),
+            bg="#2b2b2b",
+            fg="#888888",
+            wraplength=360,
+            justify=tk.LEFT,
+        ).pack(anchor="w", padx=14, pady=(0, 8))
 
         def _spin_row(parent: tk.Widget, label: str, var: tk.StringVar) -> None:
             row = tk.Frame(parent, bg="#2b2b2b")
@@ -1490,33 +1436,48 @@ class HikCameraApp:
             pady=4,
         ).pack(side=tk.LEFT, padx=6)
 
-    def check_required_production_expiry_boxes(self, boxes: list[dict]) -> bool:
+    def evaluate_production_expiry_boxes(
+        self, boxes: list[dict]
+    ) -> tuple[bool, Dict[str, Any]]:
         """
-        下拉策略三语校验 + 可选日期检测（``_date_check_config``）。
-
-        通过返回 True；未通过则 :meth:`callRelayAction` 并返回 False。
+        三语策略 + 可选日期检测；返回 (是否通过, 结构化报告)。
+        未通过时触发继电器。
         """
         texts = [str(b.get("text", "") or "") for b in boxes]
-        cfg = self._date_check_config
-        strategy = self._active_production_strategy()
+        combo_name = self._production_strategy_var.get()
+        if combo_name == _PRODUCTION_STRATEGY_COLON_CJK:
+            strategy = self._strategy_colon_cjk
+            strategy_cfg = dict(self._colon_cjk_strategy_cfg)
+        else:
+            strategy = self._strategy_strict
+            strategy_cfg = {}
 
-        if not strategy.match(texts):
-            self.callRelayAction()
-            return False
-
-        if cfg.enable_date_check and not validate_shelf_life_dates(texts, cfg):
-            self.callRelayAction()
-            return False
+        report = build_ocr_check_report(
+            texts,
+            combo_name=combo_name,
+            strategy=strategy,
+            strategy_cfg=strategy_cfg,
+            date_cfg=self._date_check_config,
+        )
+        self._last_check_report = report
 
         print(
-            "[HikCameraApp] ocr_check pass "
-            f"strategy={type(strategy).__name__} "
-            f"enable_date_check={cfg.enable_date_check} "
-            f"shelf_life_normal={cfg.shelf_life_normal} "
-            f"shelf_life_frozen={cfg.shelf_life_frozen}",
+            "[HikCameraApp] ocr_check "
+            f"verdict={report.get('verdict')} "
+            f"strategy={combo_name} "
+            f"strategy_params={report.get('strategy', {}).get('params')} "
+            f"enable_date_check={self._date_check_config.enable_date_check} "
+            f"ng_trigger={report.get('ng_trigger')}",
             flush=True,
         )
-        return True
+
+        if not report["passed"]:
+            self.callRelayAction()
+        return bool(report["passed"]), report
+
+    def check_required_production_expiry_boxes(self, boxes: list[dict]) -> bool:
+        passed, _report = self.evaluate_production_expiry_boxes(boxes)
+        return passed
 
     def _trigger_sdk_ints(self) -> Tuple[int, int, int]:
         """TriggerMode / TriggerSource ints from MVS headers (with safe fallbacks)."""
@@ -1892,6 +1853,7 @@ class HikCameraApp:
             "mode": ocr_data.get("mode"),
             "infer_seconds": float(ocr_data.get("infer_seconds") or 0.0),
             "required_phrases_pass": bool(ocr_data.get("required_phrases_pass")),
+            "check_report": ocr_data.get("check_report"),
             "paddle_raw_rec_count": ocr_data.get("paddle_raw_rec_count"),
             "paddle_boxes_after_filter": ocr_data.get("paddle_boxes_after_filter"),
             "boxes": rows,
@@ -2003,7 +1965,7 @@ class HikCameraApp:
             boxes, paddle_debug = predict_boxes(
                 self.ocr_engine, frame_bgr, return_debug=True
             )
-            pass_check = self.check_required_production_expiry_boxes(boxes)
+            pass_check, check_report = self.evaluate_production_expiry_boxes(boxes)
             infer_s = time.perf_counter() - t0
 
             ocr_data = {
@@ -2012,6 +1974,7 @@ class HikCameraApp:
                 "mode": "paddle_full_image_detect.predict_boxes",
                 "infer_seconds": float(infer_s),
                 "required_phrases_pass": pass_check,
+                "check_report": check_report,
                 "paddle_raw_rec_count": paddle_debug.get("raw_rec_count"),
                 "paddle_boxes_after_filter": paddle_debug.get("boxes_after_filter"),
             }
@@ -2046,7 +2009,10 @@ class HikCameraApp:
             text_summary = f"合法文本框 {n} 个"
             if long_texts:
                 text_summary += f"（列表中长度>=2 的共 {len(long_texts)} 个）"
-            self.update_status(f"✅ OCR 完成 — {text_summary}", "#00ff00")
+            self.update_status(
+                f"{'✅' if pass_check else '❌'} OCR 完成 — {text_summary}",
+                "#00ff00" if pass_check else "#ff6666",
+            )
             if dialog_on_success:
                 messagebox.showinfo(
                     "成功",

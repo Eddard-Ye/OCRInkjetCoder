@@ -19,9 +19,10 @@ _DATE_RE = re.compile(
     r"(?P<d>\d{1,2})"
 )
 
-_KEY_PRODUCTION = "\u751f\u4ea7\u65e5\u671f"
-_KEY_NORMAL = "\u5e38\u6e29"
-_KEY_FROZEN = "\u51b7\u51bb"
+
+def _system_today() -> date:
+    """Local calendar date (production date when date check is enabled)."""
+    return date.today()
 
 
 @dataclass
@@ -78,24 +79,94 @@ def parse_first_date_in_text(text: str) -> Optional[date]:
         return None
 
 
-def _line_date_for_keyword(texts: Sequence[str], keyword: str) -> Optional[date]:
-    for t in texts:
-        if keyword in t:
-            dt = parse_first_date_in_text(t)
-            if dt is not None:
-                return dt
-    return None
+def _parsed_dates_by_text_index(texts: Sequence[str]) -> dict[int, date]:
+    """Map each OCR line index to its first parsed date (skip lines without date)."""
+    out: dict[int, date] = {}
+    for i, t in enumerate(texts):
+        dt = parse_first_date_in_text(t)
+        if dt is not None:
+            out[i] = dt
+    return out
+
+
+def diagnose_shelf_life_dates(
+    texts: Sequence[str],
+    cfg: DateCheckGlobalConfig,
+) -> dict[str, Any]:
+    """
+    Structured diagnosis: three distinct OCR lines must parse to today / +normal / +frozen.
+    """
+    today = _system_today()
+    expect_normal = today + timedelta(days=int(cfg.shelf_life_normal))
+    expect_frozen = today + timedelta(days=int(cfg.shelf_life_frozen))
+    expected = {
+        "production": today.isoformat(),
+        "normal_expiry": expect_normal.isoformat(),
+        "frozen_expiry": expect_frozen.isoformat(),
+    }
+
+    by_idx = _parsed_dates_by_text_index(texts)
+    parsed_lines = [
+        {
+            "index": i,
+            "text": str(texts[i]),
+            "date": dt.isoformat(),
+        }
+        for i, dt in sorted(by_idx.items())
+    ]
+
+    roles = (
+        ("production", today, "生产日(系统当天)"),
+        ("normal_expiry", expect_normal, f"常温到期(+{cfg.shelf_life_normal}天)"),
+        ("frozen_expiry", expect_frozen, f"冷冻到期(+{cfg.shelf_life_frozen}天)"),
+    )
+
+    failures: list[dict[str, Any]] = []
+    if len(by_idx) < 3:
+        failures.append(
+            {
+                "code": "TOO_FEW_DATE_LINES",
+                "role": "all",
+                "message": f"至少 3 行可解析日期，当前仅 {len(by_idx)} 行",
+                "expected_date": None,
+            }
+        )
+
+    used: set[int] = set()
+    for role, target, desc in roles:
+        matched = False
+        for idx, dt in by_idx.items():
+            if idx in used:
+                continue
+            if dt == target:
+                used.add(idx)
+                matched = True
+                break
+        if not matched:
+            failures.append(
+                {
+                    "code": f"MISSING_{role.upper()}",
+                    "role": role,
+                    "message": (
+                        f"未找到独立 OCR 行解析为 {target.isoformat()}（{desc}）"
+                    ),
+                    "expected_date": target.isoformat(),
+                }
+            )
+
+    passed = len(failures) == 0
+    return {
+        "passed": passed,
+        "expected_dates": expected,
+        "system_today": today.isoformat(),
+        "parsed_lines": parsed_lines,
+        "failure": failures[0] if failures else None,
+        "failures": failures,
+    }
 
 
 def validate_shelf_life_dates(
     texts: Sequence[str],
     cfg: DateCheckGlobalConfig,
 ) -> bool:
-    prod = _line_date_for_keyword(texts, _KEY_PRODUCTION)
-    normal_exp = _line_date_for_keyword(texts, _KEY_NORMAL)
-    frozen_exp = _line_date_for_keyword(texts, _KEY_FROZEN)
-    if prod is None or normal_exp is None or frozen_exp is None:
-        return False
-    expect_normal = prod + timedelta(days=int(cfg.shelf_life_normal))
-    expect_frozen = prod + timedelta(days=int(cfg.shelf_life_frozen))
-    return normal_exp == expect_normal and frozen_exp == expect_frozen
+    return bool(diagnose_shelf_life_dates(texts, cfg)["passed"])
