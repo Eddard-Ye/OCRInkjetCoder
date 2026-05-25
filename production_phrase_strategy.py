@@ -76,6 +76,13 @@ def _lcs_length(a: str, b: str) -> int:
     return prev[n]
 
 
+def _cjk_match_percentage(cand: str, phrase_cjk: str) -> float:
+    """Ordered match ratio: LCS(cand, phrase) / len(phrase), in [0, 1]."""
+    if not phrase_cjk:
+        return 1.0
+    return _lcs_length(cand, phrase_cjk) / len(phrase_cjk)
+
+
 class StrictExclusiveSubstringStrategy:
     """
     Strategy 1: three fixed phrases vs a list of strings (or dict values).
@@ -185,14 +192,13 @@ class ColonCjkPhraseMatchStrategy:
       the substring *before* that colon; otherwise CJK are taken from the full line.
     - Let ``L_p`` / ``L_c`` be CJK lengths for phrase vs candidate region. Require
       ``abs(L_c - L_p) <= max_cjk_length_diff``.
-    - Require at least ``min_cjk_lcs_matches`` CJK that match in order between
-      candidate CJK and phrase CJK, implemented as LCS length on those two strings.
+    - Require ``LCS(cand, phrase) / len(phrase) >= min_match_percentage_limit`` (0~1).
     """
 
     __slots__ = (
         "_phrases",
         "_max_cjk_length_diff",
-        "_min_cjk_lcs_matches",
+        "_min_match_percentage_limit",
     )
 
     def __init__(
@@ -200,7 +206,7 @@ class ColonCjkPhraseMatchStrategy:
         phrases: tuple[str, ...] | None = None,
         *,
         max_cjk_length_diff: int = 2,
-        min_cjk_lcs_matches: int = 3,
+        min_match_percentage_limit: float = 0.75,
     ) -> None:
         self._phrases: tuple[str, ...] = (
             tuple(phrases) if phrases is not None else DEFAULT_REQUIRED_PHRASES
@@ -208,9 +214,11 @@ class ColonCjkPhraseMatchStrategy:
         if len(self._phrases) != 3:
             raise ValueError("ColonCjkPhraseMatchStrategy expects exactly 3 phrases")
         self._max_cjk_length_diff: int = int(max_cjk_length_diff)
-        self._min_cjk_lcs_matches: int = int(min_cjk_lcs_matches)
-        if self._max_cjk_length_diff < 0 or self._min_cjk_lcs_matches < 0:
-            raise ValueError("max_cjk_length_diff and min_cjk_lcs_matches must be >= 0")
+        self._min_match_percentage_limit: float = float(min_match_percentage_limit)
+        if self._max_cjk_length_diff < 0:
+            raise ValueError("max_cjk_length_diff must be >= 0")
+        if not (0.0 <= self._min_match_percentage_limit <= 1.0):
+            raise ValueError("min_match_percentage_limit must be in [0, 1]")
 
     @property
     def phrases(self) -> tuple[str, ...]:
@@ -228,13 +236,15 @@ class ColonCjkPhraseMatchStrategy:
         cand = _candidate_cjk_before_colon(line)
         length_diff = abs(len(cand) - len(phrase_cjk))
         lcs = _lcs_length(cand, phrase_cjk)
+        match_pct = _cjk_match_percentage(cand, phrase_cjk)
         length_ok = length_diff <= self._max_cjk_length_diff
-        lcs_ok = lcs >= self._min_cjk_lcs_matches
+        pct_ok = match_pct >= self._min_match_percentage_limit
         failed_on: Optional[str] = None
         if not length_ok:
             failed_on = "max_cjk_length_diff"
-        elif not lcs_ok:
-            failed_on = "min_cjk_lcs_matches"
+        elif not pct_ok:
+            failed_on = "min_match_percentage_limit"
+        limit = self._min_match_percentage_limit
         return {
             "phrase": phrase,
             "line": line,
@@ -243,14 +253,15 @@ class ColonCjkPhraseMatchStrategy:
             "length_diff": length_diff,
             "max_cjk_length_diff": self._max_cjk_length_diff,
             "lcs": lcs,
-            "min_cjk_lcs_matches": self._min_cjk_lcs_matches,
-            "passed": length_ok and lcs_ok,
+            "match_percentage": round(match_pct, 4),
+            "min_match_percentage_limit": limit,
+            "passed": length_ok and pct_ok,
             "failed_on": failed_on,
             "summary": (
                 (f"「{phrase}」vs「{line[:40]}…」" if len(line) > 40 else f"「{phrase}」vs「{line}」")
                 + f" | CJK {cand!r}/{len(cand)} vs {phrase_cjk!r}/{len(phrase_cjk)}"
                 + f" | Δlen={length_diff}(≤{self._max_cjk_length_diff})"
-                + f" LCS={lcs}(≥{self._min_cjk_lcs_matches})"
+                + f" match%={match_pct:.2f}(≥{limit:.2f})"
                 + (f" → 失败于 {failed_on}" if failed_on else " → OK")
             ),
         }
@@ -259,7 +270,7 @@ class ColonCjkPhraseMatchStrategy:
         cand = _candidate_cjk_before_colon(line)
         if abs(len(cand) - len(phrase_cjk)) > self._max_cjk_length_diff:
             return False
-        if _lcs_length(cand, phrase_cjk) < self._min_cjk_lcs_matches:
+        if _cjk_match_percentage(cand, phrase_cjk) < self._min_match_percentage_limit:
             return False
         return True
 
@@ -294,7 +305,7 @@ class ColonCjkPhraseMatchStrategy:
             "strategy": "ColonCjkPhraseMatchStrategy",
             "params": {
                 "max_cjk_length_diff": self._max_cjk_length_diff,
-                "min_cjk_lcs_matches": self._min_cjk_lcs_matches,
+                "min_match_percentage_limit": self._min_match_percentage_limit,
             },
             "failure": None,
         }
@@ -317,7 +328,7 @@ class ColonCjkPhraseMatchStrategy:
                 key=lambda d: (
                     0 if d["passed"] else 1,
                     d["length_diff"],
-                    -d["lcs"],
+                    -float(d.get("match_percentage", 0)),
                 )
             )
             best = details[0] if details else None

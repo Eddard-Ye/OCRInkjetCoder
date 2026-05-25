@@ -36,7 +36,7 @@ def main() -> None:
 
     strategy = ColonCjkPhraseMatchStrategy(
         max_cjk_length_diff=2,
-        min_cjk_lcs_matches=3,
+        min_match_percentage_limit=0.75,
     )
 
     paths = sorted(JSON_DIR.glob("*.json"))
@@ -60,7 +60,7 @@ def main() -> None:
     n_false = len(false_names)
 
     print(f"JSON directory: {JSON_DIR}")
-    print(f"Strategy: ColonCjkPhraseMatchStrategy (defaults: x=2, y=3)")
+    print(f"Strategy: ColonCjkPhraseMatchStrategy (defaults: x=2, min_match_percentage_limit=0.75)")
     print(f"Total JSON files: {n}")
     print(f"True:  {n_true}")
     print(f"False: {n_false}")
