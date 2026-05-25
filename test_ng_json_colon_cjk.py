@@ -35,7 +35,6 @@ def main() -> None:
         sys.exit(1)
 
     strategy = ColonCjkPhraseMatchStrategy(
-        exclude_lines_without_year=False,
         max_cjk_length_diff=2,
         min_cjk_lcs_matches=3,
     )
@@ -61,7 +60,7 @@ def main() -> None:
     n_false = len(false_names)
 
     print(f"JSON directory: {JSON_DIR}")
-    print(f"Strategy: ColonCjkPhraseMatchStrategy (defaults: x=2, y=3, no year filter)")
+    print(f"Strategy: ColonCjkPhraseMatchStrategy (defaults: x=2, y=3)")
     print(f"Total JSON files: {n}")
     print(f"True:  {n_true}")
     print(f"False: {n_false}")
