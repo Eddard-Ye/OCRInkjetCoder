@@ -301,12 +301,14 @@ class HikCameraApp:
 
         self._colon_cjk_strategy_cfg: Dict[str, Any] = {
             "max_cjk_length_diff": 2,
-            "min_cjk_lcs_matches": 3,
+            "min_match_percentage_limit": 0.75,
         }
         self._strategy_strict = StrictExclusiveSubstringStrategy()
         self._strategy_colon_cjk = ColonCjkPhraseMatchStrategy(
             max_cjk_length_diff=self._colon_cjk_strategy_cfg["max_cjk_length_diff"],
-            min_cjk_lcs_matches=self._colon_cjk_strategy_cfg["min_cjk_lcs_matches"],
+            min_match_percentage_limit=self._colon_cjk_strategy_cfg[
+                "min_match_percentage_limit"
+            ],
         )
         self._production_strategy_var = tk.StringVar(
             master=self.root,
@@ -1240,11 +1242,13 @@ class HikCameraApp:
 
         cfg = self._colon_cjk_strategy_cfg
         var_x = tk.StringVar(value=str(int(cfg.get("max_cjk_length_diff", 2))))
-        var_y = tk.StringVar(value=str(int(cfg.get("min_cjk_lcs_matches", 3))))
+        var_pct = tk.StringVar(
+            value=str(float(cfg.get("min_match_percentage_limit", 0.75)))
+        )
 
         tk.Label(
             top,
-            text="冒号前 CJK + 长度/LCS 阈值策略",
+            text="冒号前 CJK + 长度/匹配率阈值策略",
             font=("微软雅黑", 11, "bold"),
             bg="#2b2b2b",
             fg="#00ff00",
@@ -1254,7 +1258,7 @@ class HikCameraApp:
         row_x.pack(fill="x", padx=12, pady=4)
         tk.Label(
             row_x,
-            text="max_cjk_length_diff (x):",
+            text="最大长度差:",
             font=("微软雅黑", 9),
             bg="#2b2b2b",
             fg="#cccccc",
@@ -1265,20 +1269,27 @@ class HikCameraApp:
             side=tk.LEFT, padx=4
         )
 
-        row_y = tk.Frame(top, bg="#2b2b2b")
-        row_y.pack(fill="x", padx=12, pady=4)
+        row_pct = tk.Frame(top, bg="#2b2b2b")
+        row_pct.pack(fill="x", padx=12, pady=4)
         tk.Label(
-            row_y,
-            text="min_cjk_lcs_matches (y):",
+            row_pct,
+            text="最大匹配度限制:",
             font=("微软雅黑", 9),
             bg="#2b2b2b",
             fg="#cccccc",
             width=22,
             anchor="w",
         ).pack(side=tk.LEFT)
-        tk.Entry(row_y, textvariable=var_y, width=8, font=("微软雅黑", 9)).pack(
+        tk.Entry(row_pct, textvariable=var_pct, width=8, font=("微软雅黑", 9)).pack(
             side=tk.LEFT, padx=4
         )
+        tk.Label(
+            row_pct,
+            text="(0~1，LCS/短语CJK字数)",
+            font=("微软雅黑", 8),
+            bg="#2b2b2b",
+            fg="#888888",
+        ).pack(side=tk.LEFT, padx=4)
 
         btn_row = tk.Frame(top, bg="#2b2b2b")
         btn_row.pack(pady=14)
@@ -1286,18 +1297,23 @@ class HikCameraApp:
         def on_ok() -> None:
             try:
                 xd = int(str(var_x.get()).strip())
-                yd = int(str(var_y.get()).strip())
+                pct = float(str(var_pct.get()).strip())
             except ValueError:
-                messagebox.showerror("错误", "x / y 请输入非负整数", parent=top)
+                messagebox.showerror(
+                    "错误", "x 请输入非负整数；匹配率请输入小数", parent=top
+                )
                 return
-            if xd < 0 or yd < 0:
-                messagebox.showerror("错误", "x / y 须 >= 0", parent=top)
+            if xd < 0:
+                messagebox.showerror("错误", "x 须 >= 0", parent=top)
+                return
+            if not (0.0 <= pct <= 1.0):
+                messagebox.showerror("错误", "匹配率须在 0~1 之间", parent=top)
                 return
             self._colon_cjk_strategy_cfg["max_cjk_length_diff"] = xd
-            self._colon_cjk_strategy_cfg["min_cjk_lcs_matches"] = yd
+            self._colon_cjk_strategy_cfg["min_match_percentage_limit"] = pct
             self._strategy_colon_cjk = ColonCjkPhraseMatchStrategy(
                 max_cjk_length_diff=xd,
-                min_cjk_lcs_matches=yd,
+                min_match_percentage_limit=pct,
             )
             top.destroy()
 

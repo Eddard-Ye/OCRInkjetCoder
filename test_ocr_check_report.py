@@ -23,9 +23,9 @@ class TestOcrCheckReport(unittest.TestCase):
             texts,
             combo_name="ColonCjkPhraseMatchStrategy",
             strategy=ColonCjkPhraseMatchStrategy(
-                max_cjk_length_diff=1, min_cjk_lcs_matches=0
+                max_cjk_length_diff=1, min_match_percentage_limit=0.0
             ),
-            strategy_cfg={"max_cjk_length_diff": 1, "min_cjk_lcs_matches": 0},
+            strategy_cfg={"max_cjk_length_diff": 1, "min_match_percentage_limit": 0.0},
             date_cfg=DateCheckGlobalConfig(
                 enable_date_check=True, shelf_life_normal=5, shelf_life_frozen=180
             ),

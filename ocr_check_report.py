@@ -23,7 +23,9 @@ def _strategy_block(
         params = {
             "required_phrases": list(strategy.phrases),
             "max_cjk_length_diff": int(strategy_cfg.get("max_cjk_length_diff", 2)),
-            "min_cjk_lcs_matches": int(strategy_cfg.get("min_cjk_lcs_matches", 3)),
+            "min_match_percentage_limit": float(
+                strategy_cfg.get("min_match_percentage_limit", 0.75)
+            ),
         }
         class_name = "ColonCjkPhraseMatchStrategy"
     else:
@@ -102,7 +104,7 @@ def format_check_report_for_ui(report: Dict[str, Any]) -> str:
     if "max_cjk_length_diff" in params:
         lines.append(
             f"  \u53c2\u6570: max_cjk_length_diff={params.get('max_cjk_length_diff')}, "
-            f"min_cjk_lcs_matches={params.get('min_cjk_lcs_matches')}"
+            f"min_match_percentage_limit={params.get('min_match_percentage_limit')}"
         )
     phrases = params.get("required_phrases") or []
     if phrases:
