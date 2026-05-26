@@ -36,19 +36,13 @@ from paddle_full_image_detect import (
 from relay_controller import RelayController
 from date_check_config import DateCheckGlobalConfig
 from ocr_check_report import build_ocr_check_report, format_check_report_for_ui
-from production_phrase_strategy import (
-    ColonCjkPhraseMatchStrategy,
-    StrictExclusiveSubstringStrategy,
-)
+from production_phrase_strategy import ColonCjkPhraseMatchStrategy
 import license_manager
-
-_PRODUCTION_STRATEGY_STRICT = "StrictExclusiveSubstringStrategy"
-_PRODUCTION_STRATEGY_COLON_CJK = "ColonCjkPhraseMatchStrategy"
 
 _DATE_CHECK_CONFIG_PATH = os.path.join(_PROJECT_ROOT, "hik_camera_ui_date_check.json")
 _NG_HISTORY_JSON_PATH = os.path.join(_PROJECT_ROOT, "hik_camera_ui_ng_history.json")
 
-HIK_SDK_PATH = r"D:\海康威视\MVS\Development\Samples\Python"
+HIK_SDK_PATH = r"D:\MVS\Development\Samples\Python"
 SDK_PATH = os.path.join(HIK_SDK_PATH, "MvImport")
 sys.path.append(SDK_PATH)
 
@@ -303,16 +297,11 @@ class HikCameraApp:
             "max_cjk_length_diff": 2,
             "min_match_percentage_limit": 0.75,
         }
-        self._strategy_strict = StrictExclusiveSubstringStrategy()
         self._strategy_colon_cjk = ColonCjkPhraseMatchStrategy(
             max_cjk_length_diff=self._colon_cjk_strategy_cfg["max_cjk_length_diff"],
             min_match_percentage_limit=self._colon_cjk_strategy_cfg[
                 "min_match_percentage_limit"
             ],
-        )
-        self._production_strategy_var = tk.StringVar(
-            master=self.root,
-            value=_PRODUCTION_STRATEGY_STRICT,
         )
 
         self._camera_serial_for_config = ""
@@ -451,24 +440,15 @@ class HikCameraApp:
 
         tk.Label(
             strat_frame,
-            text="产线/保质期校验策略:",
+            text="产线/保质期校验: CJK 匹配",
             font=("微软雅黑", 9),
             bg="#2b2b2b",
             fg="#cccccc",
         ).pack(side=tk.LEFT, padx=(0, 6))
 
-        self._combo_production_strategy = ttk.Combobox(
-            strat_frame,
-            textvariable=self._production_strategy_var,
-            state="readonly",
-            width=36,
-            values=(_PRODUCTION_STRATEGY_STRICT, _PRODUCTION_STRATEGY_COLON_CJK),
-        )
-        self._combo_production_strategy.pack(side=tk.LEFT, padx=4)
-
         tk.Button(
             strat_frame,
-            text="编辑 ColonCjk 配置",
+            text="编辑 CJK 配置",
             command=self._open_colon_cjk_strategy_config_dialog,
             font=("微软雅黑", 9),
             bg="#37474f",
@@ -1212,30 +1192,14 @@ class HikCameraApp:
         """Hook: invoked when required label phrases are not all found in ``boxes``."""
         try:
             self.relay_controller.turn_on(1)
-            time.sleep(0.3)
+            time.sleep(0.2)
             self.relay_controller.turn_off(1)
         except Exception as e:
             messagebox.showwarning("继电器", f"继电器动作失败: {e}")
 
-    def _active_production_strategy(self):
-        """当前下拉选中的三语校验策略实例。"""
-        name = self._production_strategy_var.get()
-        if name == _PRODUCTION_STRATEGY_COLON_CJK:
-            strat = self._strategy_colon_cjk
-            cfg = dict(self._colon_cjk_strategy_cfg)
-        else:
-            strat = self._strategy_strict
-            cfg = {}
-        print(
-            "[HikCameraApp] active_production_strategy "
-            f"combo={name!r} class={type(strat).__name__} config={cfg!r}",
-            flush=True,
-        )
-        return strat
-
     def _open_colon_cjk_strategy_config_dialog(self) -> None:
         top = tk.Toplevel(self.root)
-        top.title("ColonCjkPhraseMatchStrategy")
+        top.title("CJK 匹配策略配置")
         top.configure(bg="#2b2b2b")
         top.transient(self.root)
         top.grab_set()
@@ -1460,18 +1424,11 @@ class HikCameraApp:
         未通过时触发继电器。
         """
         texts = [str(b.get("text", "") or "") for b in boxes]
-        combo_name = self._production_strategy_var.get()
-        if combo_name == _PRODUCTION_STRATEGY_COLON_CJK:
-            strategy = self._strategy_colon_cjk
-            strategy_cfg = dict(self._colon_cjk_strategy_cfg)
-        else:
-            strategy = self._strategy_strict
-            strategy_cfg = {}
+        strategy_cfg = dict(self._colon_cjk_strategy_cfg)
 
         report = build_ocr_check_report(
             texts,
-            combo_name=combo_name,
-            strategy=strategy,
+            strategy=self._strategy_colon_cjk,
             strategy_cfg=strategy_cfg,
             date_cfg=self._date_check_config,
         )
@@ -1480,14 +1437,14 @@ class HikCameraApp:
         print(
             "[HikCameraApp] ocr_check "
             f"verdict={report.get('verdict')} "
-            f"strategy={combo_name} "
+            f"strategy=ColonCjkPhraseMatchStrategy "
             f"strategy_params={report.get('strategy', {}).get('params')} "
             f"enable_date_check={self._date_check_config.enable_date_check} "
             f"ng_trigger={report.get('ng_trigger')}",
             flush=True,
         )
 
-        if not report["passed"]:
+        if report["passed"]:
             self.callRelayAction()
         return bool(report["passed"]), report
 

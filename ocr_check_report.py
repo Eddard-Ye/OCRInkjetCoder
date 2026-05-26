@@ -3,39 +3,27 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Sequence, Union
+from typing import Any, Dict, List, Optional, Sequence
 
 from date_check_config import DateCheckGlobalConfig, diagnose_shelf_life_dates
-from production_phrase_strategy import (
-    ColonCjkPhraseMatchStrategy,
-    StrictExclusiveSubstringStrategy,
-)
+from production_phrase_strategy import ColonCjkPhraseMatchStrategy
 
 
 def _strategy_block(
-    combo_name: str,
-    strategy: Union[StrictExclusiveSubstringStrategy, ColonCjkPhraseMatchStrategy],
+    strategy: ColonCjkPhraseMatchStrategy,
     strategy_cfg: Dict[str, Any],
     texts: Sequence[str],
 ) -> Dict[str, Any]:
-    if isinstance(strategy, ColonCjkPhraseMatchStrategy):
-        diag = strategy.diagnose(texts)
-        params = {
-            "required_phrases": list(strategy.phrases),
-            "max_cjk_length_diff": int(strategy_cfg.get("max_cjk_length_diff", 2)),
-            "min_match_percentage_limit": float(
-                strategy_cfg.get("min_match_percentage_limit", 0.75)
-            ),
-        }
-        class_name = "ColonCjkPhraseMatchStrategy"
-    else:
-        diag = strategy.diagnose(texts)
-        params = {"required_phrases": list(strategy.phrases)}
-        class_name = "StrictExclusiveSubstringStrategy"
-
+    diag = strategy.diagnose(texts)
+    params = {
+        "required_phrases": list(strategy.phrases),
+        "max_cjk_length_diff": int(strategy_cfg.get("max_cjk_length_diff", 2)),
+        "min_match_percentage_limit": float(
+            strategy_cfg.get("min_match_percentage_limit", 0.75)
+        ),
+    }
     return {
-        "combo_selection": combo_name,
-        "class_name": class_name,
+        "class_name": "ColonCjkPhraseMatchStrategy",
         "params": params,
         "passed": bool(diag.get("passed")),
         "text_box_count": diag.get("text_box_count"),
@@ -46,13 +34,12 @@ def _strategy_block(
 def build_ocr_check_report(
     texts: Sequence[str],
     *,
-    combo_name: str,
-    strategy: Union[StrictExclusiveSubstringStrategy, ColonCjkPhraseMatchStrategy],
+    strategy: ColonCjkPhraseMatchStrategy,
     strategy_cfg: Dict[str, Any],
     date_cfg: DateCheckGlobalConfig,
 ) -> Dict[str, Any]:
     """Full structured report for UI + NG JSON."""
-    strat = _strategy_block(combo_name, strategy, strategy_cfg, texts)
+    strat = _strategy_block(strategy, strategy_cfg, texts)
 
     date_block: Dict[str, Any] = {
         "enabled": bool(date_cfg.enable_date_check),
@@ -97,9 +84,7 @@ def format_check_report_for_ui(report: Dict[str, Any]) -> str:
 
     strat = report.get("strategy") or {}
     lines.append("[\u4ea7\u7ebf\u4e09\u8bed\u7b56\u7565]")
-    lines.append(
-        f"  \u7b56\u7565: {strat.get('combo_selection')} ({strat.get('class_name')})"
-    )
+    lines.append(f"  \u7b56\u7565: {strat.get('class_name')}")
     params = strat.get("params") or {}
     if "max_cjk_length_diff" in params:
         lines.append(

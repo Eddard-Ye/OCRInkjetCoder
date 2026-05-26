@@ -21,7 +21,6 @@ class TestOcrCheckReport(unittest.TestCase):
         ]
         report = build_ocr_check_report(
             texts,
-            combo_name="ColonCjkPhraseMatchStrategy",
             strategy=ColonCjkPhraseMatchStrategy(
                 max_cjk_length_diff=1, min_match_percentage_limit=0.0
             ),

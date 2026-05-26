@@ -2,7 +2,7 @@
 # Prerequisite (once): conda init powershell  OR  ensure conda.exe path below exists.
 
 $ErrorActionPreference = "Stop"
-$ProjectRoot = "D:\SDE\OCRInkjetCoder"
+$ProjectRoot = "D:\OCRInkjetCoder"
 
 function Initialize-CondaForSession {
     if (Get-Command conda -ErrorAction SilentlyContinue) {
@@ -29,5 +29,4 @@ function Initialize-CondaForSession {
 Initialize-CondaForSession
 conda activate OCRInkjetCoderV2
 Set-Location $ProjectRoot
-python -m pip install -q cryptography
-python "$ProjectRoot\hik_camera_ui.py"
+python "$ProjectRoot\hik_camera_ui.py" --auto-connect --hardware-trigger
