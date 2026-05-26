@@ -1,11 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-Production / expiry phrase strategies (same three strings as ``hik_camera_ui``).
+Production / expiry phrase strategy (same three strings as ``hik_camera_ui``).
 
-- Strategy 1: strict exclusive substring match.
-- Strategy 2: colon-prefix CJK length + LCS threshold vs three phrases (injective).
+Colon-prefix CJK length + LCS match-percentage threshold vs three phrases (injective).
 
-Year / shelf-life date rules live in ``date_check_config`` (not in these strategies).
+Year / shelf-life date rules live in ``date_check_config`` (not in this strategy).
 """
 
 from __future__ import annotations
@@ -83,110 +82,9 @@ def _cjk_match_percentage(cand: str, phrase_cjk: str) -> float:
     return _lcs_length(cand, phrase_cjk) / len(phrase_cjk)
 
 
-class StrictExclusiveSubstringStrategy:
-    """
-    Strategy 1: three fixed phrases vs a list of strings (or dict values).
-
-    - Substring match per phrase (same rule as the original UI check).
-    - Each string entry may be assigned to at most one phrase; phrases must use
-      three distinct entries when all three match.
-    """
-
-    __slots__ = ("_phrases",)
-
-    def __init__(
-        self,
-        phrases: tuple[str, ...] | None = None,
-    ) -> None:
-        self._phrases: tuple[str, ...] = (
-            tuple(phrases) if phrases is not None else DEFAULT_REQUIRED_PHRASES
-        )
-        if len(self._phrases) != 3:
-            raise ValueError("StrictExclusiveSubstringStrategy expects exactly 3 phrases")
-
-    @property
-    def phrases(self) -> tuple[str, ...]:
-        return self._phrases
-
-    def match(self, strings: Union[Sequence[str], Mapping[str, str]]) -> bool:
-        """
-        Return True iff there is an injective assignment: each phrase p is a substring
-        of a distinct string among ``strings``.
-        """
-        texts = _normalize_strings(strings)
-        phrases = self._phrases
-        k = len(phrases)
-        n = len(texts)
-        if n < k:
-            return False
-
-        for idxs in combinations(range(n), k):
-            chosen = [texts[i] for i in idxs]
-            for perm in permutations(range(k)):
-                if all(phrases[p] in chosen[perm[p]] for p in range(k)):
-                    return True
-        return False
-
-    def __call__(self, strings: Union[Sequence[str], Mapping[str, str]]) -> bool:
-        return self.match(strings)
-
-    def diagnose(self, strings: Union[Sequence[str], Mapping[str, str]]) -> dict[str, Any]:
-        texts = _normalize_strings(strings)
-        n = len(texts)
-        base: dict[str, Any] = {
-            "passed": False,
-            "text_box_count": n,
-            "strategy": "StrictExclusiveSubstringStrategy",
-            "failure": None,
-        }
-        if n < 3:
-            base["failure"] = {
-                "code": "INSUFFICIENT_TEXT_BOXES",
-                "message": f"至少需要 3 个 OCR 文本框，当前 {n} 个",
-            }
-            return base
-
-        if self.match(strings):
-            base["passed"] = True
-            return base
-
-        phrase_hits: list[dict[str, Any]] = []
-        for phrase in self._phrases:
-            idxs = [i for i, t in enumerate(texts) if phrase in t]
-            phrase_hits.append(
-                {
-                    "phrase": phrase,
-                    "matching_line_indices": idxs,
-                    "summary": (
-                        f"短语「{phrase}」: "
-                        + (f"命中行 {idxs}" if idxs else "无任何行包含该子串")
-                    ),
-                }
-            )
-
-        missing = [p for p in phrase_hits if not p["matching_line_indices"]]
-        if missing:
-            detail = [p["summary"] for p in missing]
-            base["failure"] = {
-                "code": "PHRASE_SUBSTRING_MISSING",
-                "message": "部分目标短语在 OCR 文本中找不到子串匹配",
-                "detail": detail,
-                "phrase_hits": phrase_hits,
-            }
-            return base
-
-        base["failure"] = {
-            "code": "NO_INJECTIVE_ASSIGNMENT",
-            "message": "各短语虽单独可匹配，但无法分配到 3 个互不相同的文本框",
-            "detail": [p["summary"] for p in phrase_hits],
-            "phrase_hits": phrase_hits,
-        }
-        return base
-
-
 class ColonCjkPhraseMatchStrategy:
     """
-    Strategy 2: same three phrases; assign each phrase to a distinct string candidate.
+    Same three phrases; assign each phrase to a distinct string candidate.
 
     - If a colon (ASCII ``:`` or fullwidth U+FF1A) exists, compare only CJK taken from
       the substring *before* that colon; otherwise CJK are taken from the full line.
