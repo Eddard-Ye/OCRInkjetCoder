@@ -34,12 +34,25 @@ from paddle_full_image_detect import (
     resolve_paddle_device,
 )
 from relay_controller import RelayController
+from colon_cjk_strategy_config import ColonCjkStrategyConfig
 from date_check_config import DateCheckGlobalConfig
+from gaussian_lowpass import (
+    GaussianLowpassConfig,
+    SIGMA_MAX,
+    apply_gaussian_lowpass,
+    clamp_sigma,
+)
 from ocr_check_report import build_ocr_check_report, format_check_report_for_ui
 from production_phrase_strategy import ColonCjkPhraseMatchStrategy
 import license_manager
 
 _DATE_CHECK_CONFIG_PATH = os.path.join(_PROJECT_ROOT, "hik_camera_ui_date_check.json")
+_COLON_CJK_STRATEGY_CONFIG_PATH = os.path.join(
+    _PROJECT_ROOT, "hik_camera_ui_colon_cjk_strategy.json"
+)
+_GAUSSIAN_LOWPASS_CONFIG_PATH = os.path.join(
+    _PROJECT_ROOT, "hik_camera_ui_gaussian_lowpass.json"
+)
 _NG_HISTORY_JSON_PATH = os.path.join(_PROJECT_ROOT, "hik_camera_ui_ng_history.json")
 
 HIK_SDK_PATH = r"D:\MVS\Development\Samples\Python"
@@ -114,6 +127,9 @@ _OCR_PANEL_IDLE = "idle"
 _OCR_PANEL_LIVE = "live"
 _OCR_PANEL_RESULT = "result"
 _OCR_PANEL_IDLE_TEXT = "请连接相机（连接后显示实时画面，便于调镜头）"
+
+# NG 文件名前缀 ``YYYYMMDD_...``，用于按日期子目录解析历史路径。
+_NG_JPG_TS_PREFIX_RE = re.compile(r"^(\d{8})_")
 
 # NG 展示区保留的最近条目数（新 NG 插在列表顶部，超出则丢弃最旧）。
 _NG_HISTORY_MAX = 20
@@ -261,13 +277,9 @@ class HikCameraApp:
         self._stats_json_path = os.path.join(_PROJECT_ROOT, "hik_camera_ui_stats.json")
 
         self.photo_save_dir = os.path.join(os.path.expanduser("~"), "HikCameraPhotos")
-        self.photo_save_dir_ok = os.path.join(self.photo_save_dir, "ok")
-        self.photo_save_dir_ng = os.path.join(self.photo_save_dir, "ng")
         self.ocr_output_dir = os.path.join(os.path.expanduser("~"), "HikCameraOCR")
         for d in (
             self.photo_save_dir,
-            self.photo_save_dir_ok,
-            self.photo_save_dir_ng,
             self.ocr_output_dir,
         ):
             if not os.path.exists(d):
@@ -292,16 +304,17 @@ class HikCameraApp:
         )
 
         self._date_check_config = DateCheckGlobalConfig.load(_DATE_CHECK_CONFIG_PATH)
-
-        self._colon_cjk_strategy_cfg: Dict[str, Any] = {
-            "max_cjk_length_diff": 2,
-            "min_match_percentage_limit": 0.75,
-        }
+        self._gaussian_lowpass_config = GaussianLowpassConfig.load(
+            _GAUSSIAN_LOWPASS_CONFIG_PATH
+        )
+        self._colon_cjk_strategy_config = ColonCjkStrategyConfig.load(
+            _COLON_CJK_STRATEGY_CONFIG_PATH
+        )
         self._strategy_colon_cjk = ColonCjkPhraseMatchStrategy(
-            max_cjk_length_diff=self._colon_cjk_strategy_cfg["max_cjk_length_diff"],
-            min_match_percentage_limit=self._colon_cjk_strategy_cfg[
-                "min_match_percentage_limit"
-            ],
+            max_cjk_length_diff=self._colon_cjk_strategy_config.max_cjk_length_diff,
+            min_match_percentage_limit=(
+                self._colon_cjk_strategy_config.min_match_percentage_limit
+            ),
         )
 
         self._camera_serial_for_config = ""
@@ -456,6 +469,36 @@ class HikCameraApp:
             padx=8,
             pady=2,
         ).pack(side=tk.LEFT, padx=4)
+
+        tk.Label(
+            strat_frame,
+            text="|",
+            font=("微软雅黑", 9),
+            bg="#2b2b2b",
+            fg="#555555",
+        ).pack(side=tk.LEFT, padx=6)
+
+        self._gaussian_lowpass_status_label = tk.Label(
+            strat_frame,
+            text="",
+            font=("微软雅黑", 9),
+            bg="#2b2b2b",
+            fg="#aaaaaa",
+        )
+        self._gaussian_lowpass_status_label.pack(side=tk.LEFT, padx=(0, 6))
+
+        tk.Button(
+            strat_frame,
+            text="高斯滤波配置",
+            command=self._open_gaussian_lowpass_config_dialog,
+            font=("微软雅黑", 9),
+            bg="#37474f",
+            fg="#ffffff",
+            padx=8,
+            pady=2,
+        ).pack(side=tk.LEFT, padx=4)
+
+        self._refresh_gaussian_lowpass_status_label()
 
         self.status_label = tk.Label(
             self.root,
@@ -784,16 +827,55 @@ class HikCameraApp:
         if canvas is not None and event.delta:
             canvas.yview_scroll(int(-event.delta / 120), "units")
 
+    def _photo_save_date_folder_name(self, when: Optional[datetime] = None) -> str:
+        dt = when or datetime.now()
+        return dt.strftime("%Y-%m-%d")
+
+    def _photo_save_subdir(
+        self,
+        kind: str,
+        when: Optional[datetime] = None,
+        *,
+        create: bool = False,
+    ) -> str:
+        """``~/HikCameraPhotos/{YYYY-MM-DD}/{ok|ng}``."""
+        path = os.path.join(
+            self.photo_save_dir,
+            self._photo_save_date_folder_name(when),
+            kind,
+        )
+        if create and not os.path.isdir(path):
+            os.makedirs(path, exist_ok=True)
+        return path
+
+    def _ensure_photo_save_subdir(
+        self, kind: str, when: Optional[datetime] = None
+    ) -> str:
+        return self._photo_save_subdir(kind, when, create=True)
+
+    def _date_folder_from_ng_basename(self, name: str) -> Optional[str]:
+        m = _NG_JPG_TS_PREFIX_RE.match(name)
+        if not m:
+            return None
+        s = m.group(1)
+        return f"{s[:4]}-{s[4:6]}-{s[6:8]}"
+
     def _resolve_ng_jpg_path(self, stored_path: str) -> str:
-        """Map list/history path to on-disk ``~/HikCameraPhotos/ng/{ts}_NG.jpg``."""
+        """Map list/history path to on-disk NG JPEG (date/ok layout or legacy ``ng/``)."""
         p = os.path.normpath(str(stored_path).strip())
         if os.path.isfile(p):
             return p
         name = os.path.basename(p)
-        if name:
-            cand = os.path.join(self.photo_save_dir_ng, name)
+        if not name:
+            return p
+        day = self._date_folder_from_ng_basename(name)
+        if day:
+            cand = os.path.join(self.photo_save_dir, day, "ng", name)
             if os.path.isfile(cand):
                 return os.path.normpath(cand)
+        cand = os.path.join(self.photo_save_dir, "ng", name)
+        if os.path.isfile(cand):
+            return os.path.normpath(cand)
         return p
 
     def _persist_ng_history_to_disk(self) -> None:
@@ -1204,11 +1286,9 @@ class HikCameraApp:
         top.transient(self.root)
         top.grab_set()
 
-        cfg = self._colon_cjk_strategy_cfg
-        var_x = tk.StringVar(value=str(int(cfg.get("max_cjk_length_diff", 2))))
-        var_pct = tk.StringVar(
-            value=str(float(cfg.get("min_match_percentage_limit", 0.75)))
-        )
+        cfg = self._colon_cjk_strategy_config
+        var_x = tk.StringVar(value=str(int(cfg.max_cjk_length_diff)))
+        var_pct = tk.StringVar(value=str(float(cfg.min_match_percentage_limit)))
 
         tk.Label(
             top,
@@ -1273,11 +1353,22 @@ class HikCameraApp:
             if not (0.0 <= pct <= 1.0):
                 messagebox.showerror("错误", "匹配率须在 0~1 之间", parent=top)
                 return
-            self._colon_cjk_strategy_cfg["max_cjk_length_diff"] = xd
-            self._colon_cjk_strategy_cfg["min_match_percentage_limit"] = pct
+            self._colon_cjk_strategy_config = ColonCjkStrategyConfig(
+                max_cjk_length_diff=xd,
+                min_match_percentage_limit=pct,
+            )
+            try:
+                self._colon_cjk_strategy_config.save(_COLON_CJK_STRATEGY_CONFIG_PATH)
+            except Exception as e:
+                messagebox.showerror("保存失败", str(e), parent=top)
+                return
             self._strategy_colon_cjk = ColonCjkPhraseMatchStrategy(
                 max_cjk_length_diff=xd,
                 min_match_percentage_limit=pct,
+            )
+            self.update_status(
+                f"CJK 配置已保存: max_len_diff={xd}, min_match_pct={pct}",
+                "#00ff00",
             )
             top.destroy()
 
@@ -1301,6 +1392,119 @@ class HikCameraApp:
             padx=14,
             pady=4,
         ).pack(side=tk.LEFT, padx=6)
+
+    def _refresh_gaussian_lowpass_status_label(self) -> None:
+        lbl = getattr(self, "_gaussian_lowpass_status_label", None)
+        if lbl is None:
+            return
+        sig = float(self._gaussian_lowpass_config.sigma)
+        if sig > 0:
+            lbl.config(text=f"高斯滤波: 开 (σ={sig:.2f})", fg="#66ccff")
+        else:
+            lbl.config(text="高斯滤波: 关 (σ=0)", fg="#888888")
+
+    def _open_gaussian_lowpass_config_dialog(self) -> None:
+        top = tk.Toplevel(self.root)
+        top.title("高斯滤波配置")
+        top.configure(bg="#2b2b2b")
+        top.transient(self.root)
+        top.grab_set()
+        top.resizable(False, False)
+
+        cfg = self._gaussian_lowpass_config
+        var_sigma = tk.StringVar(value=f"{float(cfg.sigma):.2f}")
+
+        tk.Label(
+            top,
+            text="高斯滤波配置",
+            font=("微软雅黑", 11, "bold"),
+            bg="#2b2b2b",
+            fg="#00ff00",
+        ).pack(anchor="w", padx=14, pady=(12, 8))
+
+        tk.Label(
+            top,
+            text=(
+                "解码为 BGR 后、预览/OCR/落盘前统一应用空间低通。\n"
+                f"σ=0 关闭；σ>0 启用（范围 0～{SIGMA_MAX:.1f} 像素，与离线测试映射一致）。"
+            ),
+            font=("微软雅黑", 8),
+            bg="#2b2b2b",
+            fg="#888888",
+            wraplength=380,
+            justify=tk.LEFT,
+        ).pack(anchor="w", padx=14, pady=(0, 10))
+
+        row = tk.Frame(top, bg="#2b2b2b")
+        row.pack(fill="x", padx=14, pady=6)
+        tk.Label(
+            row,
+            text="σ (sigma)",
+            font=("微软雅黑", 9),
+            bg="#2b2b2b",
+            fg="#cccccc",
+            width=14,
+            anchor="w",
+        ).pack(side=tk.LEFT)
+        tk.Spinbox(
+            row,
+            from_=0.0,
+            to=SIGMA_MAX,
+            increment=0.1,
+            format="%.1f",
+            textvariable=var_sigma,
+            width=8,
+            font=("微软雅黑", 10),
+            justify="center",
+        ).pack(side=tk.LEFT, padx=4)
+
+        btn_row = tk.Frame(top, bg="#2b2b2b")
+        btn_row.pack(pady=(16, 14), padx=14)
+
+        def on_save() -> None:
+            try:
+                sigma = clamp_sigma(float(str(var_sigma.get()).strip()))
+            except ValueError:
+                messagebox.showerror("错误", "σ 请输入数字", parent=top)
+                return
+            self._gaussian_lowpass_config = GaussianLowpassConfig(sigma=sigma)
+            try:
+                self._gaussian_lowpass_config.save(_GAUSSIAN_LOWPASS_CONFIG_PATH)
+            except Exception as e:
+                messagebox.showerror("保存失败", str(e), parent=top)
+                return
+            self._refresh_gaussian_lowpass_status_label()
+            state = "启用" if sigma > 0 else "关闭"
+            self.update_status(f"高斯滤波已保存: {state} σ={sigma:.2f}", "#00ff00")
+            top.destroy()
+
+        tk.Button(
+            btn_row,
+            text="保存",
+            command=on_save,
+            font=("微软雅黑", 10),
+            bg="#006600",
+            fg="white",
+            padx=14,
+            pady=4,
+        ).pack(side=tk.LEFT, padx=6)
+        tk.Button(
+            btn_row,
+            text="取消",
+            command=top.destroy,
+            font=("微软雅黑", 10),
+            bg="#555555",
+            fg="white",
+            padx=14,
+            pady=4,
+        ).pack(side=tk.LEFT, padx=6)
+
+    def _apply_gaussian_after_decode(self, bgr: np.ndarray) -> np.ndarray:
+        """Single hook after ``_decode_raw_to_bgr`` for preview, OCR, and saves."""
+        sigma = float(self._gaussian_lowpass_config.sigma)
+        if sigma <= 0:
+            return bgr
+        return apply_gaussian_lowpass(bgr, sigma)
 
     def _open_date_check_config_dialog(self) -> None:
         top = tk.Toplevel(self.root)
@@ -1424,7 +1628,7 @@ class HikCameraApp:
         未通过时触发继电器。
         """
         texts = [str(b.get("text", "") or "") for b in boxes]
-        strategy_cfg = dict(self._colon_cjk_strategy_cfg)
+        strategy_cfg = self._colon_cjk_strategy_config.to_dict()
 
         report = build_ocr_check_report(
             texts,
@@ -1654,11 +1858,15 @@ class HikCameraApp:
                 img: Optional[np.ndarray], path: str
             ) -> Optional[np.ndarray]:
                 out = self._finish_decode(img, path, pt)
+                if out is not None:
+                    out = self._apply_gaussian_after_decode(out)
                 if log_path and out is not None:
                     h, w = out.shape[:2]
+                    gs = float(self._gaussian_lowpass_config.sigma)
+                    gs_note = f" gaussian_sigma={gs:.2f}" if gs > 0 else ""
                     print(
                         "[HikCameraApp] decode "
-                        f"path={path!r} pixel_type=0x{pt:x} size={w}x{h}",
+                        f"path={path!r} pixel_type=0x{pt:x} size={w}x{h}{gs_note}",
                         flush=True,
                     )
                 return out
@@ -1842,27 +2050,28 @@ class HikCameraApp:
         render_bgr: Optional[np.ndarray] = None,
     ) -> None:
         """
-        Queue saving capture under ``photo_save_dir_ok`` or ``photo_save_dir_ng``.
+        Queue saving capture under ``~/HikCameraPhotos/{YYYY-MM-DD}/ok|ng``.
 
-        NG → ``~/HikCameraPhotos/ng/``：渲染图 ``{时间戳}_NG.jpg`` + 可选 ``.json``。
-        OK → ``~/HikCameraPhotos/ok/``：原图 ``ocr_{meta}_OK_{ts}.jpg``（约 1/10 概率）。
+        NG → ``.../{date}/ng/``：渲染图 ``{时间戳}_NG.jpg`` + 可选 ``.json``。
+        OK → ``.../{date}/ok/``：原图 ``ocr_{meta}_OK_{ts}.jpg``（约 1/10 概率）。
         """
         try:
             if pass_check and random.random() >= 0.1:
                 return
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+            now = datetime.now()
+            ts = now.strftime("%Y%m%d_%H%M%S_%f")[:-3]
             safe = "".join(
                 c if (c.isalnum() or c in "-_") else "_" for c in (meta_file or "shot")
             )[:48]
             if pass_check:
-                save_dir = self.photo_save_dir_ok
+                save_dir = self._ensure_photo_save_subdir("ok", now)
                 fname = f"ocr_{safe}_OK_{ts}.jpg"
                 img = np.ascontiguousarray(frame_bgr).copy()
                 json_payload = None
                 json_path = None
                 register_ng = False
             else:
-                save_dir = self.photo_save_dir_ng
+                save_dir = self._ensure_photo_save_subdir("ng", now)
                 fname = f"{ts}_NG.jpg"
                 src = render_bgr if render_bgr is not None else frame_bgr
                 img = np.ascontiguousarray(src).copy()
@@ -1919,8 +2128,8 @@ class HikCameraApp:
         Must run on the Tk main thread if it touches widgets / messagebox.
 
         If ``persist_original_capture`` is True (拍照+OCR / 硬触发), after OCR writes
-        NG under ``photo_save_dir_ng`` (always, rendered + JSON); OK under
-        ``photo_save_dir_ok`` (original, ~1/10).
+        NG under ``~/HikCameraPhotos/{date}/ng/`` (always, rendered + JSON); OK under
+        ``~/HikCameraPhotos/{date}/ok/`` (original, ~1/10).
         """
         if self.ocr_engine is None:
             if dialog_on_error:

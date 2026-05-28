@@ -2,7 +2,7 @@
 # Prerequisite (once): conda init powershell  OR  ensure conda.exe path below exists.
 
 $ErrorActionPreference = "Stop"
-$ProjectRoot = "D:\OCRInkjetCoder"
+$ProjectRoot = "D:\OCRInkjetCoder_V3"
 
 function Initialize-CondaForSession {
     if (Get-Command conda -ErrorAction SilentlyContinue) {
