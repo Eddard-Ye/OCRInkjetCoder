@@ -10,3 +10,6 @@ outputs_loose/
 outputs_sam_label/
 license_keys/
 license.lic
+data/*
+data2/*
+outputs/*
