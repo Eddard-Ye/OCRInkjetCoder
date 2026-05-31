@@ -1398,10 +1398,17 @@ class HikCameraApp:
         if lbl is None:
             return
         sig = float(self._gaussian_lowpass_config.sigma)
+        debug = bool(self._gaussian_lowpass_config.debug_mode)
         if sig > 0:
-            lbl.config(text=f"高斯滤波: 开 (σ={sig:.2f})", fg="#66ccff")
+            text = f"高斯滤波: 开 (σ={sig:.2f})"
+            fg = "#66ccff"
         else:
-            lbl.config(text="高斯滤波: 关 (σ=0)", fg="#888888")
+            text = "高斯滤波: 关 (σ=0)"
+            fg = "#888888"
+        if debug:
+            text += " | 调试存原图"
+            fg = "#ffcc66"
+        lbl.config(text=text, fg=fg)
 
     def _open_gaussian_lowpass_config_dialog(self) -> None:
         top = tk.Toplevel(self.root)
@@ -1413,6 +1420,7 @@ class HikCameraApp:
 
         cfg = self._gaussian_lowpass_config
         var_sigma = tk.StringVar(value=f"{float(cfg.sigma):.2f}")
+        var_debug = tk.BooleanVar(value=bool(cfg.debug_mode))
 
         tk.Label(
             top,
@@ -1458,6 +1466,29 @@ class HikCameraApp:
             justify="center",
         ).pack(side=tk.LEFT, padx=4)
 
+        debug_row = tk.Frame(top, bg="#2b2b2b")
+        debug_row.pack(fill="x", padx=14, pady=(10, 4))
+        tk.Checkbutton(
+            debug_row,
+            text="调试模式（每次 OCR 另存喂入识别的原图，PNG 无损）",
+            variable=var_debug,
+            font=("微软雅黑", 9),
+            bg="#2b2b2b",
+            fg="#cccccc",
+            selectcolor="#1a1a1a",
+            activebackground="#2b2b2b",
+            activeforeground="#ffffff",
+            anchor="w",
+        ).pack(anchor="w")
+        tk.Label(
+            debug_row,
+            text=f"保存目录: {self.ocr_output_dir}/debug/{{日期}}/",
+            font=("微软雅黑", 8),
+            bg="#2b2b2b",
+            fg="#666666",
+            anchor="w",
+        ).pack(anchor="w", pady=(2, 0))
+
         btn_row = tk.Frame(top, bg="#2b2b2b")
         btn_row.pack(pady=(16, 14), padx=14)
 
@@ -1467,7 +1498,11 @@ class HikCameraApp:
             except ValueError:
                 messagebox.showerror("错误", "σ 请输入数字", parent=top)
                 return
-            self._gaussian_lowpass_config = GaussianLowpassConfig(sigma=sigma)
+            debug_mode = bool(var_debug.get())
+            self._gaussian_lowpass_config = GaussianLowpassConfig(
+                sigma=sigma,
+                debug_mode=debug_mode,
+            )
             try:
                 self._gaussian_lowpass_config.save(_GAUSSIAN_LOWPASS_CONFIG_PATH)
             except Exception as e:
@@ -1475,7 +1510,11 @@ class HikCameraApp:
                 return
             self._refresh_gaussian_lowpass_status_label()
             state = "启用" if sigma > 0 else "关闭"
-            self.update_status(f"高斯滤波已保存: {state} σ={sigma:.2f}", "#00ff00")
+            dbg = "开" if debug_mode else "关"
+            self.update_status(
+                f"高斯滤波已保存: {state} σ={sigma:.2f} | 调试模式: {dbg}",
+                "#00ff00",
+            )
             top.destroy()
 
         tk.Button(
@@ -1505,6 +1544,46 @@ class HikCameraApp:
         if sigma <= 0:
             return bgr
         return apply_gaussian_lowpass(bgr, sigma)
+
+    def _ocr_debug_input_dir(self, when: Optional[datetime] = None) -> str:
+        """``~/HikCameraOCR/debug/{YYYY-MM-DD}/`` for lossless OCR input dumps."""
+        day = self._photo_save_date_folder_name(when)
+        return os.path.join(self.ocr_output_dir, "debug", day)
+
+    def _save_ocr_debug_input_png(
+        self,
+        frame_bgr: np.ndarray,
+        meta_file: str,
+    ) -> None:
+        """Save the exact BGR fed to ``predict_boxes`` (no det/OK-NG overlay)."""
+        if not bool(self._gaussian_lowpass_config.debug_mode):
+            return
+        try:
+            now = datetime.now()
+            ts = now.strftime("%Y%m%d_%H%M%S_%f")[:-3]
+            safe = "".join(
+                c if (c.isalnum() or c in "-_") else "_" for c in (meta_file or "shot")
+            )[:48]
+            save_dir = self._ocr_debug_input_dir(now)
+            fname = f"ocr_input_{safe}_{ts}.png"
+            path = os.path.join(save_dir, fname)
+            img = np.ascontiguousarray(frame_bgr).copy()
+
+            def _worker() -> None:
+                try:
+                    if not os.path.isdir(save_dir):
+                        os.makedirs(save_dir, exist_ok=True)
+                    cv2.imwrite(
+                        path,
+                        img,
+                        [int(cv2.IMWRITE_PNG_COMPRESSION), 0],
+                    )
+                except Exception:
+                    pass
+
+            threading.Thread(target=_worker, daemon=True).start()
+        except Exception:
+            pass
 
     def _open_date_check_config_dialog(self) -> None:
         top = tk.Toplevel(self.root)
@@ -2143,6 +2222,7 @@ class HikCameraApp:
             self._enter_ocr_panel_result_mode()
             self._log_decode_path_for_ocr(meta_file)
             frame_bgr = prepare_bgr_for_predict(frame_bgr)
+            self._save_ocr_debug_input_png(frame_bgr, meta_file)
             t0 = time.perf_counter()
             boxes, paddle_debug = predict_boxes(
                 self.ocr_engine, frame_bgr, return_debug=True

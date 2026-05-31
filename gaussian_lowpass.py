@@ -21,12 +21,16 @@ class GaussianLowpassConfig:
     """User-facing sigma in OpenCV pixels; 0 means filter off."""
 
     sigma: float = 0.0
+    debug_mode: bool = False
 
     def enabled(self) -> bool:
         return float(self.sigma) > 0.0
 
     def to_dict(self) -> dict[str, Any]:
-        return {"sigma": float(self.sigma)}
+        return {
+            "sigma": float(self.sigma),
+            "debug_mode": bool(self.debug_mode),
+        }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> GaussianLowpassConfig:
@@ -36,7 +40,7 @@ class GaussianLowpassConfig:
             sigma = float(data.get("sigma", 0.0))
         except (TypeError, ValueError):
             sigma = 0.0
-        return cls(sigma=clamp_sigma(sigma))
+        return cls(sigma=clamp_sigma(sigma), debug_mode=bool(data.get("debug_mode", False)))
 
     @classmethod
     def load(cls, path: str) -> GaussianLowpassConfig:
