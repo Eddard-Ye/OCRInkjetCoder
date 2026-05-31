@@ -1470,7 +1470,7 @@ class HikCameraApp:
         debug_row.pack(fill="x", padx=14, pady=(10, 4))
         tk.Checkbutton(
             debug_row,
-            text="调试模式（每次 OCR 另存喂入识别的原图，PNG 无损）",
+            text="调试模式（NG 时另存喂入 OCR 的原图，PNG 无损）",
             variable=var_debug,
             font=("微软雅黑", 9),
             bg="#2b2b2b",
@@ -1554,9 +1554,11 @@ class HikCameraApp:
         self,
         frame_bgr: np.ndarray,
         meta_file: str,
+        *,
+        pass_check: bool,
     ) -> None:
-        """Save the exact BGR fed to ``predict_boxes`` (no det/OK-NG overlay)."""
-        if not bool(self._gaussian_lowpass_config.debug_mode):
+        """On NG + debug_mode: save BGR fed to ``predict_boxes`` (no overlays)."""
+        if pass_check or not bool(self._gaussian_lowpass_config.debug_mode):
             return
         try:
             now = datetime.now()
@@ -2222,12 +2224,14 @@ class HikCameraApp:
             self._enter_ocr_panel_result_mode()
             self._log_decode_path_for_ocr(meta_file)
             frame_bgr = prepare_bgr_for_predict(frame_bgr)
-            self._save_ocr_debug_input_png(frame_bgr, meta_file)
             t0 = time.perf_counter()
             boxes, paddle_debug = predict_boxes(
                 self.ocr_engine, frame_bgr, return_debug=True
             )
             pass_check, check_report = self.evaluate_production_expiry_boxes(boxes)
+            self._save_ocr_debug_input_png(
+                frame_bgr, meta_file, pass_check=pass_check
+            )
             infer_s = time.perf_counter() - t0
 
             ocr_data = {
