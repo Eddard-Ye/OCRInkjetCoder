@@ -42,12 +42,12 @@ from gaussian_lowpass import (
     apply_gaussian_lowpass,
     clamp_sigma,
 )
-from median_lowpass import (
-    MedianLowpassConfig,
-    STRENGTH_MAX as MEDIAN_STRENGTH_MAX,
-    apply_median_lowpass,
-    clamp_strength as clamp_median_strength,
-    kernel_size_from_strength,
+from morph_close_lowpass import (
+    MorphCloseLowpassConfig,
+    STRENGTH_MAX as MORPH_CLOSE_STRENGTH_MAX,
+    apply_morph_close_lowpass,
+    clamp_strength as clamp_morph_close_strength,
+    morph_close_kernel_from_strength,
 )
 from ocr_check_report import build_ocr_check_report, format_check_report_for_ui
 from production_phrase_strategy import ColonCjkPhraseMatchStrategy
@@ -60,8 +60,8 @@ _COLON_CJK_STRATEGY_CONFIG_PATH = os.path.join(
 _GAUSSIAN_LOWPASS_CONFIG_PATH = os.path.join(
     _PROJECT_ROOT, "hik_camera_ui_gaussian_lowpass.json"
 )
-_MEDIAN_LOWPASS_CONFIG_PATH = os.path.join(
-    _PROJECT_ROOT, "hik_camera_ui_median_lowpass.json"
+_MORPH_CLOSE_LOWPASS_CONFIG_PATH = os.path.join(
+    _PROJECT_ROOT, "hik_camera_ui_morph_close_lowpass.json"
 )
 _NG_HISTORY_JSON_PATH = os.path.join(_PROJECT_ROOT, "hik_camera_ui_ng_history.json")
 
@@ -317,8 +317,8 @@ class HikCameraApp:
         self._gaussian_lowpass_config = GaussianLowpassConfig.load(
             _GAUSSIAN_LOWPASS_CONFIG_PATH
         )
-        self._median_lowpass_config = MedianLowpassConfig.load(
-            _MEDIAN_LOWPASS_CONFIG_PATH
+        self._morph_close_lowpass_config = MorphCloseLowpassConfig.load(
+            _MORPH_CLOSE_LOWPASS_CONFIG_PATH
         )
         self._colon_cjk_strategy_config = ColonCjkStrategyConfig.load(
             _COLON_CJK_STRATEGY_CONFIG_PATH
@@ -513,19 +513,19 @@ class HikCameraApp:
 
         self._refresh_gaussian_lowpass_status_label()
 
-        self._median_lowpass_status_label = tk.Label(
+        self._morph_close_lowpass_status_label = tk.Label(
             strat_frame,
             text="",
             font=("微软雅黑", 9),
             bg="#2b2b2b",
             fg="#aaaaaa",
         )
-        self._median_lowpass_status_label.pack(side=tk.LEFT, padx=(0, 6))
+        self._morph_close_lowpass_status_label.pack(side=tk.LEFT, padx=(0, 6))
 
         tk.Button(
             strat_frame,
-            text="中值滤波配置",
-            command=self._open_median_lowpass_config_dialog,
+            text="形态学闭运算配置",
+            command=self._open_morph_close_lowpass_config_dialog,
             font=("微软雅黑", 9),
             bg="#37474f",
             fg="#ffffff",
@@ -533,7 +533,7 @@ class HikCameraApp:
             pady=2,
         ).pack(side=tk.LEFT, padx=4)
 
-        self._refresh_median_lowpass_status_label()
+        self._refresh_morph_close_lowpass_status_label()
 
         self.status_label = tk.Label(
             self.root,
@@ -1579,50 +1579,50 @@ class HikCameraApp:
             return bgr
         return apply_gaussian_lowpass(bgr, sigma)
 
-    def _apply_median_after_decode(self, bgr: np.ndarray) -> np.ndarray:
-        cfg = self._median_lowpass_config
+    def _apply_morph_close_after_decode(self, bgr: np.ndarray) -> np.ndarray:
+        cfg = self._morph_close_lowpass_config
         if not cfg.active():
             return bgr
-        return apply_median_lowpass(bgr, float(cfg.strength))
+        return apply_morph_close_lowpass(bgr, float(cfg.strength))
 
     def _apply_spatial_filters_after_decode(self, bgr: np.ndarray) -> np.ndarray:
-        """After ``_decode_raw_to_bgr``: Gaussian first, then median (preview/OCR/saves)."""
+        """After ``_decode_raw_to_bgr``: Gaussian first, then morph_close (preview/OCR/saves)."""
         bgr = self._apply_gaussian_after_decode(bgr)
-        return self._apply_median_after_decode(bgr)
+        return self._apply_morph_close_after_decode(bgr)
 
-    def _refresh_median_lowpass_status_label(self) -> None:
-        lbl = getattr(self, "_median_lowpass_status_label", None)
+    def _refresh_morph_close_lowpass_status_label(self) -> None:
+        lbl = getattr(self, "_morph_close_lowpass_status_label", None)
         if lbl is None:
             return
-        cfg = self._median_lowpass_config
+        cfg = self._morph_close_lowpass_config
         strength = float(cfg.strength)
         if cfg.active():
-            k = kernel_size_from_strength(strength)
-            text = f"中值滤波: 开 (strength={strength:.0f}, k={k})"
+            ks = morph_close_kernel_from_strength(strength)
+            text = f"形态学闭运算: 开 (strength={strength:.0f}, ks={ks})"
             fg = "#66ccff"
         elif cfg.enabled and strength <= 0:
-            text = "中值滤波: 开但 strength=0"
+            text = "形态学闭运算: 开但 strength=0"
             fg = "#ffcc66"
         else:
-            text = "中值滤波: 关"
+            text = "形态学闭运算: 关"
             fg = "#888888"
         lbl.config(text=text, fg=fg)
 
-    def _open_median_lowpass_config_dialog(self) -> None:
+    def _open_morph_close_lowpass_config_dialog(self) -> None:
         top = tk.Toplevel(self.root)
-        top.title("中值滤波配置")
+        top.title("形态学闭运算配置")
         top.configure(bg="#2b2b2b")
         top.transient(self.root)
         top.grab_set()
         top.resizable(False, False)
 
-        cfg = self._median_lowpass_config
+        cfg = self._morph_close_lowpass_config
         var_enabled = tk.BooleanVar(value=bool(cfg.enabled))
         var_strength = tk.StringVar(value=f"{float(cfg.strength):.0f}")
 
         tk.Label(
             top,
-            text="中值滤波配置",
+            text="形态学闭运算配置",
             font=("微软雅黑", 11, "bold"),
             bg="#2b2b2b",
             fg="#00ff00",
@@ -1631,8 +1631,8 @@ class HikCameraApp:
         tk.Label(
             top,
             text=(
-                "解码为 BGR 并应用高斯滤波后、预览/OCR/落盘前再应用中值滤波。\n"
-                f"strength=0 无效果；启用且 strength>0 时核大小 k 为 3～9（与离线测试一致）。"
+                "解码为 BGR 并应用高斯滤波后、预览/OCR/落盘前再应用形态学闭运算。\n"
+                "strength=0 无效果；启用且 strength>0 时按离线测试映射（灰度 close，可连接点阵缺口）。"
             ),
             font=("微软雅黑", 8),
             bg="#2b2b2b",
@@ -1645,7 +1645,7 @@ class HikCameraApp:
         enable_row.pack(fill="x", padx=14, pady=(0, 6))
         tk.Checkbutton(
             enable_row,
-            text="启用中值滤波",
+            text="启用形态学闭运算",
             variable=var_enabled,
             font=("微软雅黑", 9),
             bg="#2b2b2b",
@@ -1670,7 +1670,7 @@ class HikCameraApp:
         tk.Spinbox(
             row,
             from_=0.0,
-            to=MEDIAN_STRENGTH_MAX,
+            to=MORPH_CLOSE_STRENGTH_MAX,
             increment=1.0,
             format="%.0f",
             textvariable=var_strength,
@@ -1684,29 +1684,31 @@ class HikCameraApp:
 
         def on_save() -> None:
             try:
-                strength = clamp_median_strength(float(str(var_strength.get()).strip()))
+                strength = clamp_morph_close_strength(
+                    float(str(var_strength.get()).strip())
+                )
             except ValueError:
                 messagebox.showerror("错误", "strength 请输入数字", parent=top)
                 return
             enabled = bool(var_enabled.get())
-            self._median_lowpass_config = MedianLowpassConfig(
+            self._morph_close_lowpass_config = MorphCloseLowpassConfig(
                 enabled=enabled,
                 strength=strength,
             )
             try:
-                self._median_lowpass_config.save(_MEDIAN_LOWPASS_CONFIG_PATH)
+                self._morph_close_lowpass_config.save(_MORPH_CLOSE_LOWPASS_CONFIG_PATH)
             except Exception as e:
                 messagebox.showerror("保存失败", str(e), parent=top)
                 return
-            self._refresh_median_lowpass_status_label()
-            if self._median_lowpass_config.active():
-                k = kernel_size_from_strength(strength)
-                state = f"启用 strength={strength:.0f} k={k}"
+            self._refresh_morph_close_lowpass_status_label()
+            if self._morph_close_lowpass_config.active():
+                ks = morph_close_kernel_from_strength(strength)
+                state = f"启用 strength={strength:.0f} ks={ks}"
             elif enabled:
-                state = f"已启用但 strength=0（无效果）"
+                state = "已启用但 strength=0（无效果）"
             else:
                 state = "关闭"
-            self.update_status(f"中值滤波已保存: {state}", "#00ff00")
+            self.update_status(f"形态学闭运算已保存: {state}", "#00ff00")
             top.destroy()
 
         tk.Button(
@@ -2130,18 +2132,18 @@ class HikCameraApp:
                     h, w = out.shape[:2]
                     gs = float(self._gaussian_lowpass_config.sigma)
                     gs_note = f" gaussian_sigma={gs:.2f}" if gs > 0 else ""
-                    med_cfg = self._median_lowpass_config
-                    if med_cfg.active():
-                        med_note = (
-                            f" median_strength={float(med_cfg.strength):.0f}"
-                            f" k={kernel_size_from_strength(med_cfg.strength)}"
+                    morph_cfg = self._morph_close_lowpass_config
+                    if morph_cfg.active():
+                        morph_note = (
+                            f" morph_close_strength={float(morph_cfg.strength):.0f}"
+                            f" ks={morph_close_kernel_from_strength(morph_cfg.strength)}"
                         )
                     else:
-                        med_note = ""
+                        morph_note = ""
                     print(
                         "[HikCameraApp] decode "
                         f"path={path!r} pixel_type=0x{pt:x} size={w}x{h}"
-                        f"{gs_note}{med_note}",
+                        f"{gs_note}{morph_note}",
                         flush=True,
                     )
                 return out
