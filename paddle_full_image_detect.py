@@ -395,7 +395,7 @@ def main() -> None:
     parser.add_argument("--det-limit-side-len", type=int, default=2560)
     parser.add_argument("--det-thresh", type=float, default=0.10)
     parser.add_argument("--det-box-thresh", type=float, default=0.35)
-    parser.add_argument("--det-unclip-ratio", type=float, default=2.0)
+    parser.add_argument("--det-unclip-ratio", type=float, default=1.8)
     parser.add_argument(
         "--no-labels",
         action="store_true",
