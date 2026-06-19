@@ -93,6 +93,57 @@ _CAMERA_FEATURE_SCHEMA: List[Tuple[str, str]] = [
     ("DeviceUserID", "string"),
 ]
 
+# GenICam 参数在配置界面中的中文显示名（写入相机仍用英文 key / Symbolic）。
+_CAMERA_PARAM_LABELS_ZH: Dict[str, str] = {
+    "Width": "宽度",
+    "Height": "高度",
+    "OffsetX": "水平偏移",
+    "OffsetY": "垂直偏移",
+    "PixelFormat": "像素格式",
+    "AcquisitionMode": "采集模式",
+    "ExposureAuto": "自动曝光",
+    "ExposureTime": "曝光时间",
+    "GainAuto": "自动增益",
+    "Gain": "增益",
+    "AcquisitionFrameRateEnable": "帧率限制启用",
+    "AcquisitionFrameRate": "采集帧率",
+    "TriggerMode": "触发模式",
+    "TriggerSource": "触发源",
+    "TriggerActivation": "触发沿",
+    "BalanceWhiteAuto": "自动白平衡",
+    "DeviceUserID": "设备用户 ID",
+}
+
+_CAMERA_FTYPE_LABELS_ZH: Dict[str, str] = {
+    "int": "整数",
+    "float": "浮点",
+    "bool": "布尔",
+    "enum": "枚举",
+    "string": "字符串",
+}
+
+
+def _camera_param_label_zh(key: str) -> str:
+    return _CAMERA_PARAM_LABELS_ZH.get(key, key)
+
+
+def _camera_ftype_label_zh(ftype: str) -> str:
+    return _CAMERA_FTYPE_LABELS_ZH.get(ftype, ftype)
+
+
+def _camera_config_range_label_zh(range_text: str) -> str:
+    """Translate range hints for the config table; values stay as-is."""
+    s = str(range_text or "").strip()
+    if not s:
+        return ""
+    if s == "true | false":
+        return "可填 true 或 false"
+    if s.startswith("enum cur="):
+        return "当前枚举值=" + s[len("enum cur=") :]
+    if s.startswith("max_len="):
+        return "最大长度=" + s[len("max_len=") :]
+    return s.replace(" step ", " 步进 ")
+
 # GenICam set order: size/offset after pixel format; manual exposure/gain after auto switches.
 _CAMERA_PARAM_APPLY_ORDER: tuple[str, ...] = (
     "AcquisitionMode",
@@ -231,6 +282,25 @@ def _format_genicam_float_for_display(fv: float) -> str:
     return s if s else "0"
 
 
+def _default_camera_config_preview_json() -> Optional[str]:
+    """Pick a saved camera JSON for offline UI preview (newest under ``camera_configs/``)."""
+    cfg_dir = os.path.join(_PROJECT_ROOT, "camera_configs")
+    preferred = os.path.join(cfg_dir, "DA9652820.json")
+    if os.path.isfile(preferred):
+        return preferred
+    if not os.path.isdir(cfg_dir):
+        return None
+    candidates = [
+        os.path.join(cfg_dir, name)
+        for name in os.listdir(cfg_dir)
+        if name.lower().endswith(".json")
+    ]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+    return candidates[0]
+
+
 def _parse_startup_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="海康工业相机 + OCR识别系统")
     parser.add_argument(
@@ -243,6 +313,16 @@ def _parse_startup_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="自动连接后切换到 Line0 硬触发（需与 --auto-connect 同时使用）",
     )
+    parser.add_argument(
+        "--preview-camera-config",
+        action="store_true",
+        help="无相机时用本地 camera_configs/*.json 预览「配置相机」界面",
+    )
+    parser.add_argument(
+        "--preview-config-file",
+        default="",
+        help="预览模式使用的 JSON 路径（默认选 camera_configs 下最新备份）",
+    )
     return parser.parse_args(argv)
 
 
@@ -252,9 +332,17 @@ class HikCameraApp:
         *,
         startup_auto_connect: bool = False,
         startup_hardware_trigger: bool = False,
+        camera_config_preview_mode: bool = False,
+        camera_config_preview_json: Optional[str] = None,
     ):
         self._startup_auto_connect = startup_auto_connect
         self._startup_hardware_trigger = startup_hardware_trigger
+        self._camera_config_preview_mode = bool(camera_config_preview_mode)
+        self._camera_config_preview_json = (
+            camera_config_preview_json.strip()
+            if camera_config_preview_json
+            else ""
+        )
 
         self.root = tk.Tk()
         self.root.title("海康工业相机 - 实时监控系统")
@@ -342,10 +430,17 @@ class HikCameraApp:
         self._last_check_report: Optional[Dict[str, Any]] = None
 
         self.setup_ui()
+        if self._camera_config_preview_mode:
+            self.btn_config_camera.config(state="normal")
+            self.update_status(
+                "预览模式：未连接相机，可打开「配置相机」调试界面",
+                "#ffcc66",
+            )
         self.protocol()
         self._load_stats_from_disk()
         self._load_ng_history_from_disk()
-        self._init_ocr_engine()
+        if not self._camera_config_preview_mode:
+            self._init_ocr_engine()
         try:
             self._license_info = license_manager.check_license()
         except license_manager.LicenseError:
@@ -2601,6 +2696,50 @@ class HikCameraApp:
         sn = self._safe_config_filename_serial(self._camera_serial_for_config)
         return os.path.join(self._camera_config_dir, f"{sn}.json")
 
+    def _resolve_camera_config_preview_json(self) -> str:
+        if self._camera_config_preview_json:
+            path = os.path.abspath(self._camera_config_preview_json)
+            if not os.path.isfile(path):
+                raise FileNotFoundError(f"预览 JSON 不存在: {path}")
+            return path
+        path = _default_camera_config_preview_json()
+        if not path:
+            raise FileNotFoundError(
+                "未找到 camera_configs/*.json，请先连接相机保存一次，"
+                "或用 --preview-config-file 指定文件。"
+            )
+        return path
+
+    def _load_camera_config_rows_from_json(
+        self, json_path: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        path = json_path or self._resolve_camera_config_preview_json()
+        with open(path, encoding="utf-8") as f:
+            payload = json.load(f)
+        serial = str(payload.get("serial", "")).strip()
+        if serial:
+            self._camera_serial_for_config = serial
+        rows = payload.get("rows")
+        if not isinstance(rows, list) or not rows:
+            raise ValueError(f"预览 JSON 无有效 rows: {path}")
+        out: List[Dict[str, Any]] = []
+        for item in rows:
+            if not isinstance(item, dict):
+                continue
+            out.append(
+                {
+                    "key": str(item.get("key", "")),
+                    "ftype": str(item.get("ftype", "")),
+                    "value": str(item.get("value", "")),
+                    "range": str(item.get("range", "")),
+                    "read_ok": bool(item.get("read_ok", True)),
+                    "read_err": int(item.get("read_err", 0)),
+                }
+            )
+        if not out:
+            raise ValueError(f"预览 JSON rows 为空: {path}")
+        return out
+
     def _read_floatish_genicam_numeric(self, key: str, row: Dict[str, Any]) -> None:
         """
         Read nodes like ``ExposureTime`` / ``Gain`` that MVS shows as large integers (e.g. µs)
@@ -2886,23 +3025,43 @@ class HikCameraApp:
         return errors
 
     def open_camera_config_dialog(self) -> None:
-        if not self.b_open_device:
+        preview = self._camera_config_preview_mode and not self.b_open_device
+        if not self.b_open_device and not preview:
             messagebox.showwarning("配置相机", "请先连接相机。")
             return
 
         win = tk.Toplevel(self.root)
-        win.title("配置相机")
+        win.title("配置相机（预览）" if preview else "配置相机")
         win.geometry("900x560")
         win.configure(bg="#2b2b2b")
+
+        preview_note = ""
+        if preview:
+            try:
+                preview_path = self._resolve_camera_config_preview_json()
+                preview_note = (
+                    f"【预览模式】数据来自本地 JSON，不会写入真实相机：\n{preview_path}\n\n"
+                )
+            except Exception as e:
+                messagebox.showerror("配置相机", f"无法加载预览数据: {e}")
+                win.destroy()
+                return
 
         hint = tk.Label(
             win,
             text=(
-                "保存时会短暂停止取流再写入相机（否则 Width/Height 等多数机型无法在采集中修改）。"
-                "修改曝光时间前会自动尝试关闭 ExposureAuto；修改 Gain 前会尝试关闭 GainAuto。"
-                "若仍失败请对照「范围」检查步进与单位（曝光多为微秒）。"
-                "PixelFormat 请填相机 XML 的 Symbolic（如 BayerRG8），与 MVS 里「Bayer RG 8」对应但无空格；"
-                "程序保存时会自动去掉空格并纠正 Bayer 大小写。"
+                preview_note
+                + (
+                    "预览模式：保存仅更新本机 JSON，不连接相机、不暂停取流。"
+                    if preview
+                    else (
+                        "保存时会短暂停止取流再写入相机（否则宽度/高度等多数机型无法在采集中修改）。"
+                        "修改曝光时间前会自动尝试关闭自动曝光；修改增益前会尝试关闭自动增益。"
+                        "若仍失败请对照「范围」检查步进与单位（曝光多为微秒）。"
+                        "像素格式请填相机 XML 的 Symbolic（如 BayerRG8），与 MVS 里「Bayer RG 8」对应但无空格；"
+                        "程序保存时会自动去掉空格并纠正 Bayer 大小写。"
+                    )
+                )
             ),
             font=("微软雅黑", 9),
             bg="#2b2b2b",
@@ -2951,22 +3110,24 @@ class HikCameraApp:
                     w.destroy()
             row_widgets.clear()
             for i, r in enumerate(rows_in, start=1):
+                key = str(r["key"])
+                ftype = str(r["ftype"])
                 tk.Label(
                     inner,
-                    text=r["key"],
-                    font=("Consolas", 9),
+                    text=_camera_param_label_zh(key),
+                    font=("微软雅黑", 9),
                     bg="#1a1a1a",
                     fg="#e0e0e0",
                 ).grid(row=i, column=0, sticky="w", padx=6, pady=1)
                 tk.Label(
                     inner,
-                    text=str(r["ftype"]),
-                    font=("Consolas", 9),
+                    text=_camera_ftype_label_zh(ftype),
+                    font=("微软雅黑", 9),
                     bg="#1a1a1a",
                     fg="#a0c4ff",
                 ).grid(row=i, column=1, sticky="w", padx=4, pady=1)
                 v = tk.StringVar(value=str(r.get("value", "")))
-                row_widgets.append((str(r["key"]), str(r["ftype"]), v))
+                row_widgets.append((key, ftype, v))
                 tk.Entry(
                     inner,
                     textvariable=v,
@@ -2977,7 +3138,7 @@ class HikCameraApp:
                     insertbackground="white",
                 ).grid(row=i, column=2, sticky="w", padx=4, pady=1)
                 hint_txt = (
-                    str(r.get("range", ""))
+                    _camera_config_range_label_zh(str(r.get("range", "")))
                     if r.get("read_ok")
                     else f"读取失败 0x{int(r.get('read_err', 0)):x}"
                 )
@@ -2994,7 +3155,10 @@ class HikCameraApp:
 
         def refresh_from_camera():
             try:
-                rows = self._collect_camera_config_rows()
+                if preview:
+                    rows = self._load_camera_config_rows_from_json()
+                else:
+                    rows = self._collect_camera_config_rows()
             except Exception as e:
                 messagebox.showerror("配置相机", f"读取失败: {e}")
                 return
@@ -3011,6 +3175,19 @@ class HikCameraApp:
                         "read_ok": True,
                     }
                 )
+            if preview:
+                try:
+                    self._write_camera_config_json_file(rows_out)
+                    rebuild_table(rows_out)
+                    messagebox.showinfo(
+                        "保存",
+                        "预览模式：已写入本机 JSON（未连接相机）:\n"
+                        f"{self._camera_config_json_path()}",
+                    )
+                except Exception as e:
+                    messagebox.showerror("保存", f"预览模式保存 JSON 失败: {e}")
+                return
+
             if not self._mode_switch_lock.acquire(blocking=True, timeout=30.0):
                 messagebox.showwarning("保存", "正在切换触发模式，请稍后再试保存。")
                 return
@@ -3052,14 +3229,14 @@ class HikCameraApp:
         btn_bar.pack(fill="x", padx=10, pady=8)
         tk.Button(
             btn_bar,
-            text="从相机刷新",
+            text="从 JSON 刷新" if preview else "从相机刷新",
             command=refresh_from_camera,
             font=("微软雅黑", 10),
             width=14,
         ).pack(side="left", padx=4)
         tk.Button(
             btn_bar,
-            text="保存（写入相机 + 本机 JSON）",
+            text="保存到本机 JSON（预览）" if preview else "保存（写入相机 + 本机 JSON）",
             command=save_apply,
             font=("微软雅黑", 10),
             width=26,
@@ -3413,6 +3590,8 @@ class HikCameraApp:
         self.update_capture_stats_display()
         if self._startup_auto_connect:
             self.root.after(200, self._startup_auto_connect_and_hw_trigger)
+        if self._camera_config_preview_mode:
+            self.root.after(300, self.open_camera_config_dialog)
         self.root.mainloop()
 
 
@@ -3447,8 +3626,16 @@ if __name__ == "__main__":
             "提示: --auto-connect 与 --hardware-trigger 需同时使用才会自动连接并切硬触发；"
             "当前按手动模式启动。"
         )
+    _preview_cfg = bool(_args.preview_camera_config)
+    _preview_json = (_args.preview_config_file or "").strip()
+    if _preview_cfg:
+        print("预览模式：将用本地 camera_configs JSON 打开「配置相机」界面")
+        if _preview_json:
+            print(f"预览 JSON: {_preview_json}")
     app = HikCameraApp(
         startup_auto_connect=_auto_connect,
         startup_hardware_trigger=_hw_trigger,
+        camera_config_preview_mode=_preview_cfg,
+        camera_config_preview_json=_preview_json or None,
     )
     app.run()
