@@ -49,6 +49,29 @@ from morph_close_lowpass import (
     clamp_strength as clamp_morph_close_strength,
     morph_close_kernel_from_strength,
 )
+from hik_camera_photo_storage import (
+    DEFAULT_PHOTO_STORAGE_LIMIT_GB,
+    cleanup_photo_storage,
+    cleanup_result_to_log_line,
+    directory_size_bytes,
+    format_bytes,
+    milliseconds_until_daily_time,
+    photo_storage_limit_bytes,
+)
+from white_bg_segment import (
+    MIN_AREA_SCALE,
+    WhiteBgSegmentConfig,
+    apply_aux_segment_overlay,
+    clamp_close_k,
+    clamp_h,
+    clamp_open_k,
+    clamp_sv,
+    draw_white_rect_on_bgr,
+    filter_ocr_boxes_by_white_rect,
+    min_area_from_slider,
+    min_area_to_slider,
+    segment_white_background,
+)
 from ocr_check_report import build_ocr_check_report, format_check_report_for_ui
 from production_phrase_strategy import ColonCjkPhraseMatchStrategy
 import license_manager
@@ -62,6 +85,9 @@ _GAUSSIAN_LOWPASS_CONFIG_PATH = os.path.join(
 )
 _MORPH_CLOSE_LOWPASS_CONFIG_PATH = os.path.join(
     _PROJECT_ROOT, "hik_camera_ui_morph_close_lowpass.json"
+)
+_WHITE_BG_SEGMENT_CONFIG_PATH = os.path.join(
+    _PROJECT_ROOT, "hik_camera_ui_white_bg_segment.json"
 )
 _NG_HISTORY_JSON_PATH = os.path.join(_PROJECT_ROOT, "hik_camera_ui_ng_history.json")
 
@@ -288,6 +314,11 @@ class HikCameraApp:
 
         self.photo_save_dir = os.path.join(os.path.expanduser("~"), "HikCameraPhotos")
         self.ocr_output_dir = os.path.join(os.path.expanduser("~"), "HikCameraOCR")
+        self._photo_storage_limit_bytes = photo_storage_limit_bytes(
+            DEFAULT_PHOTO_STORAGE_LIMIT_GB
+        )
+        self._photo_cleanup_lock = threading.Lock()
+        self._photo_cleanup_running = False
         for d in (
             self.photo_save_dir,
             self.ocr_output_dir,
@@ -320,6 +351,10 @@ class HikCameraApp:
         self._morph_close_lowpass_config = MorphCloseLowpassConfig.load(
             _MORPH_CLOSE_LOWPASS_CONFIG_PATH
         )
+        self._white_bg_segment_config = WhiteBgSegmentConfig.load(
+            _WHITE_BG_SEGMENT_CONFIG_PATH
+        )
+        self._white_bg_config_lock = threading.Lock()
         self._colon_cjk_strategy_config = ColonCjkStrategyConfig.load(
             _COLON_CJK_STRATEGY_CONFIG_PATH
         )
@@ -513,19 +548,19 @@ class HikCameraApp:
 
         self._refresh_gaussian_lowpass_status_label()
 
-        self._morph_close_lowpass_status_label = tk.Label(
+        self._white_bg_segment_status_label = tk.Label(
             strat_frame,
             text="",
             font=("微软雅黑", 9),
             bg="#2b2b2b",
             fg="#aaaaaa",
         )
-        self._morph_close_lowpass_status_label.pack(side=tk.LEFT, padx=(0, 6))
+        self._white_bg_segment_status_label.pack(side=tk.LEFT, padx=(0, 6))
 
         tk.Button(
             strat_frame,
-            text="形态学闭运算配置",
-            command=self._open_morph_close_lowpass_config_dialog,
+            text="白底分割配置",
+            command=self._open_white_bg_segment_config_dialog,
             font=("微软雅黑", 9),
             bg="#37474f",
             fg="#ffffff",
@@ -533,7 +568,7 @@ class HikCameraApp:
             pady=2,
         ).pack(side=tk.LEFT, padx=4)
 
-        self._refresh_morph_close_lowpass_status_label()
+        self._refresh_white_bg_segment_status_label()
 
         self.status_label = tk.Label(
             self.root,
@@ -862,6 +897,90 @@ class HikCameraApp:
         if canvas is not None and event.delta:
             canvas.yview_scroll(int(-event.delta / 120), "units")
 
+    def _prune_ng_history_after_photo_cleanup(self, deleted_dirs: List[str]) -> None:
+        if not deleted_dirs:
+            return
+        deleted_prefixes = tuple(
+            os.path.normpath(p.rstrip(os.sep)) + os.sep for p in deleted_dirs
+        )
+        kept: List[str] = []
+        for stored in self._ng_history_paths:
+            resolved = os.path.normpath(self._resolve_ng_jpg_path(stored))
+            if any(resolved.startswith(prefix) for prefix in deleted_prefixes):
+                continue
+            if os.path.isfile(resolved):
+                kept.append(stored)
+        if len(kept) != len(self._ng_history_paths):
+            self._ng_history_paths = kept
+            self._refresh_ng_list_ui()
+            self._persist_ng_history_to_disk()
+
+    def _log_photo_storage_cleanup(self, result) -> None:
+        line = cleanup_result_to_log_line(result)
+        print(line, flush=True)
+        if result.deleted_dirs:
+            for path in result.deleted_dirs:
+                print(f"  removed: {path}", flush=True)
+
+    def _run_photo_storage_cleanup(self, reason: str) -> None:
+        result = cleanup_photo_storage(
+            self.photo_save_dir,
+            limit_bytes=self._photo_storage_limit_bytes,
+            reason=reason,
+        )
+        if result.deleted_dirs:
+            self.root.after(
+                0,
+                lambda dirs=list(result.deleted_dirs): self._prune_ng_history_after_photo_cleanup(
+                    dirs
+                ),
+            )
+        self._log_photo_storage_cleanup(result)
+
+    def _start_photo_storage_cleanup_async(self, reason: str) -> None:
+        size_now = directory_size_bytes(self.photo_save_dir)
+        if size_now <= self._photo_storage_limit_bytes:
+            print(
+                f"[photo_storage] skip {reason}: "
+                f"{format_bytes(size_now)} <= limit "
+                f"{format_bytes(self._photo_storage_limit_bytes)}",
+                flush=True,
+            )
+            return
+        with self._photo_cleanup_lock:
+            if self._photo_cleanup_running:
+                print(f"[photo_storage] skip {reason}: cleanup already running", flush=True)
+                return
+            self._photo_cleanup_running = True
+
+        def _worker() -> None:
+            try:
+                self._run_photo_storage_cleanup(reason)
+            finally:
+                with self._photo_cleanup_lock:
+                    self._photo_cleanup_running = False
+
+        threading.Thread(target=_worker, daemon=True, name="photo-storage-cleanup").start()
+
+    def _schedule_next_noon_photo_cleanup(self) -> None:
+        delay_ms = milliseconds_until_daily_time()
+        self.root.after(delay_ms, self._on_scheduled_noon_photo_cleanup)
+
+    def _on_scheduled_noon_photo_cleanup(self) -> None:
+        print("[photo_storage] scheduled noon check", flush=True)
+        self._start_photo_storage_cleanup_async("scheduled_noon")
+        self._schedule_next_noon_photo_cleanup()
+
+    def _start_photo_storage_maintenance(self) -> None:
+        print(
+            f"[photo_storage] monitor {self.photo_save_dir} "
+            f"limit={format_bytes(self._photo_storage_limit_bytes)} "
+            f"daily_cleanup=12:00",
+            flush=True,
+        )
+        self._start_photo_storage_cleanup_async("startup")
+        self._schedule_next_noon_photo_cleanup()
+
     def _photo_save_date_folder_name(self, when: Optional[datetime] = None) -> str:
         dt = when or datetime.now()
         return dt.strftime("%Y-%m-%d")
@@ -1135,6 +1254,17 @@ class HikCameraApp:
         self.result_text.insert(tk.END, f"模式: {mode}\n")
         self.result_text.insert(tk.END, f"识别数量: {len(boxes)} 个文本框\n")
         self.result_text.insert(tk.END, f"推理时间: {infer_time:.3f}s\n")
+        if ocr_data.get("white_bg_validation_enabled"):
+            rect = ocr_data.get("white_bg_rect_xyxy")
+            rejected = int(ocr_data.get("white_bg_rejected_boxes") or 0)
+            before = ocr_data.get("paddle_boxes_before_white_bg")
+            rect_text = rect if rect else "未找到白底"
+            self.result_text.insert(
+                tk.END,
+                f"白底校验: 剔除 {rejected} 个"
+                f"{f'（Paddle 原始 {before} 个）' if before is not None else ''}"
+                f" | 矩形: {rect_text}\n",
+            )
         self.result_text.insert(tk.END, "-" * 30 + "\n\n")
 
         long_texts = []
@@ -1246,7 +1376,8 @@ class HikCameraApp:
         """Tk 主线程：仅在 live 模式下刷新识别结果框。"""
         if self._ocr_panel_mode != _OCR_PANEL_LIVE:
             return
-        img_tk = self._bgr_to_ocr_panel_photo(bgr)
+        display_bgr = self._apply_white_bg_display_overlay(bgr)
+        img_tk = self._bgr_to_ocr_panel_photo(display_bgr)
         if img_tk is None:
             return
         self._ocr_panel_photo = img_tk
@@ -1590,39 +1721,64 @@ class HikCameraApp:
         bgr = self._apply_gaussian_after_decode(bgr)
         return self._apply_morph_close_after_decode(bgr)
 
-    def _refresh_morph_close_lowpass_status_label(self) -> None:
-        lbl = getattr(self, "_morph_close_lowpass_status_label", None)
+    def _get_white_bg_config_snapshot(self) -> WhiteBgSegmentConfig:
+        with self._white_bg_config_lock:
+            return WhiteBgSegmentConfig.from_dict(self._white_bg_segment_config.to_dict())
+
+    def _segment_frame_white_bg(self, frame_bgr: np.ndarray):
+        return segment_white_background(frame_bgr, self._get_white_bg_config_snapshot())
+
+    def _apply_white_bg_display_overlay(self, frame_bgr: np.ndarray) -> np.ndarray:
+        cfg = self._get_white_bg_config_snapshot()
+        if not cfg.enable_aux_overlay:
+            return frame_bgr
+        if frame_bgr is None or frame_bgr.size == 0:
+            return frame_bgr
+        seg = self._segment_frame_white_bg(frame_bgr)
+        return apply_aux_segment_overlay(frame_bgr, seg)
+
+    def _refresh_white_bg_segment_status_label(self) -> None:
+        lbl = getattr(self, "_white_bg_segment_status_label", None)
         if lbl is None:
             return
-        cfg = self._morph_close_lowpass_config
-        strength = float(cfg.strength)
-        if cfg.active():
-            ks = morph_close_kernel_from_strength(strength)
-            text = f"形态学闭运算: 开 (strength={strength:.0f}, ks={ks})"
+        cfg = self._get_white_bg_config_snapshot()
+        parts: List[str] = []
+        if cfg.enable_validation:
+            parts.append("校验开")
+        if cfg.enable_aux_overlay:
+            parts.append("辅助开")
+        if parts:
+            text = f"白底分割: {' | '.join(parts)}"
             fg = "#66ccff"
-        elif cfg.enabled and strength <= 0:
-            text = "形态学闭运算: 开但 strength=0"
-            fg = "#ffcc66"
         else:
-            text = "形态学闭运算: 关"
+            text = "白底分割: 关"
             fg = "#888888"
         lbl.config(text=text, fg=fg)
 
-    def _open_morph_close_lowpass_config_dialog(self) -> None:
+    def _open_white_bg_segment_config_dialog(self) -> None:
         top = tk.Toplevel(self.root)
-        top.title("形态学闭运算配置")
+        top.title("白底分割配置")
         top.configure(bg="#2b2b2b")
         top.transient(self.root)
         top.grab_set()
         top.resizable(False, False)
 
-        cfg = self._morph_close_lowpass_config
-        var_enabled = tk.BooleanVar(value=bool(cfg.enabled))
-        var_strength = tk.StringVar(value=f"{float(cfg.strength):.0f}")
+        cfg = self._get_white_bg_config_snapshot()
+        var_h_min = tk.IntVar(value=cfg.h_min)
+        var_h_max = tk.IntVar(value=cfg.h_max)
+        var_s_min = tk.IntVar(value=cfg.s_min)
+        var_s_max = tk.IntVar(value=cfg.s_max)
+        var_v_min = tk.IntVar(value=cfg.v_min)
+        var_v_max = tk.IntVar(value=cfg.v_max)
+        var_close_k = tk.IntVar(value=cfg.close_k)
+        var_open_k = tk.IntVar(value=cfg.open_k)
+        var_min_area = tk.IntVar(value=min_area_to_slider(cfg.min_area))
+        var_enable_validation = tk.BooleanVar(value=bool(cfg.enable_validation))
+        var_enable_aux_overlay = tk.BooleanVar(value=bool(cfg.enable_aux_overlay))
 
         tk.Label(
             top,
-            text="形态学闭运算配置",
+            text="白底分割配置",
             font=("微软雅黑", 11, "bold"),
             bg="#2b2b2b",
             fg="#00ff00",
@@ -1631,22 +1787,91 @@ class HikCameraApp:
         tk.Label(
             top,
             text=(
-                "解码为 BGR 并应用高斯滤波后、预览/OCR/落盘前再应用形态学闭运算。\n"
-                "strength=0 无效果；启用且 strength>0 时按离线测试映射（灰度 close，可连接点阵缺口）。"
+                "HSV 阈值 + 形态学生成白底矩形；开启校验后仅保留落在该矩形内的 PaddleOCR 文本框。\n"
+                "开启辅助配置后，预览/OCR 图像叠加浅色掩膜与矩形，便于理解分割结果。"
             ),
             font=("微软雅黑", 8),
             bg="#2b2b2b",
             fg="#888888",
-            wraplength=380,
+            wraplength=520,
             justify=tk.LEFT,
-        ).pack(anchor="w", padx=14, pady=(0, 10))
+        ).pack(anchor="w", padx=14, pady=(0, 8))
 
-        enable_row = tk.Frame(top, bg="#2b2b2b")
-        enable_row.pack(fill="x", padx=14, pady=(0, 6))
+        body = tk.Frame(top, bg="#2b2b2b")
+        body.pack(fill="both", expand=True, padx=14)
+
+        slider_specs = [
+            ("H_min", var_h_min, 0, 179),
+            ("H_max", var_h_max, 0, 179),
+            ("S_min", var_s_min, 0, 255),
+            ("S_max", var_s_max, 0, 255),
+            ("V_min", var_v_min, 0, 255),
+            ("V_max", var_v_max, 0, 255),
+            ("close_k", var_close_k, 0, 51),
+            ("open_k", var_open_k, 0, 31),
+            (
+                f"min_area (x{MIN_AREA_SCALE})",
+                var_min_area,
+                0,
+                5000,
+            ),
+        ]
+        value_labels: dict[str, tk.Label] = {}
+
+        def _sync_value_label(name: str, var: tk.IntVar) -> None:
+            lbl = value_labels.get(name)
+            if lbl is None:
+                return
+            if name.startswith("min_area"):
+                lbl.config(text=str(min_area_from_slider(int(var.get()))))
+            else:
+                lbl.config(text=str(int(var.get())))
+
+        for name, var, lo, hi in slider_specs:
+            row = tk.Frame(body, bg="#2b2b2b")
+            row.pack(fill="x", pady=3)
+            tk.Label(
+                row,
+                text=name,
+                font=("微软雅黑", 9),
+                bg="#2b2b2b",
+                fg="#cccccc",
+                width=16,
+                anchor="w",
+            ).pack(side=tk.LEFT)
+            val_lbl = tk.Label(
+                row,
+                text="",
+                font=("微软雅黑", 9),
+                bg="#2b2b2b",
+                fg="#ffcc66",
+                width=8,
+                anchor="e",
+            )
+            val_lbl.pack(side=tk.RIGHT)
+            value_labels[name] = val_lbl
+            tk.Scale(
+                row,
+                from_=lo,
+                to=hi,
+                orient=tk.HORIZONTAL,
+                variable=var,
+                length=320,
+                showvalue=False,
+                bg="#2b2b2b",
+                fg="#cccccc",
+                troughcolor="#1a1a1a",
+                highlightthickness=0,
+                command=lambda _v, n=name, vr=var: _sync_value_label(n, vr),
+            ).pack(side=tk.LEFT, padx=(6, 8))
+            _sync_value_label(name, var)
+
+        flag_row = tk.Frame(body, bg="#2b2b2b")
+        flag_row.pack(fill="x", pady=(12, 4))
         tk.Checkbutton(
-            enable_row,
-            text="启用形态学闭运算",
-            variable=var_enabled,
+            flag_row,
+            text="开启白底校验（OCR 文本框须在白底矩形内）",
+            variable=var_enable_validation,
             font=("微软雅黑", 9),
             bg="#2b2b2b",
             fg="#cccccc",
@@ -1655,60 +1880,51 @@ class HikCameraApp:
             activeforeground="#ffffff",
             anchor="w",
         ).pack(anchor="w")
-
-        row = tk.Frame(top, bg="#2b2b2b")
-        row.pack(fill="x", padx=14, pady=6)
-        tk.Label(
-            row,
-            text="strength (0-100)",
+        tk.Checkbutton(
+            flag_row,
+            text="开启辅助配置（预览/OCR 图叠加浅色白底掩膜与矩形）",
+            variable=var_enable_aux_overlay,
             font=("微软雅黑", 9),
             bg="#2b2b2b",
             fg="#cccccc",
-            width=14,
+            selectcolor="#1a1a1a",
+            activebackground="#2b2b2b",
+            activeforeground="#ffffff",
             anchor="w",
-        ).pack(side=tk.LEFT)
-        tk.Spinbox(
-            row,
-            from_=0.0,
-            to=MORPH_CLOSE_STRENGTH_MAX,
-            increment=1.0,
-            format="%.0f",
-            textvariable=var_strength,
-            width=8,
-            font=("微软雅黑", 10),
-            justify="center",
-        ).pack(side=tk.LEFT, padx=4)
+        ).pack(anchor="w", pady=(4, 0))
 
         btn_row = tk.Frame(top, bg="#2b2b2b")
         btn_row.pack(pady=(16, 14), padx=14)
 
         def on_save() -> None:
+            new_cfg = WhiteBgSegmentConfig(
+                h_min=clamp_h(int(var_h_min.get())),
+                h_max=clamp_h(int(var_h_max.get())),
+                s_min=clamp_sv(int(var_s_min.get())),
+                s_max=clamp_sv(int(var_s_max.get())),
+                v_min=clamp_sv(int(var_v_min.get())),
+                v_max=clamp_sv(int(var_v_max.get())),
+                close_k=clamp_close_k(int(var_close_k.get())),
+                open_k=clamp_open_k(int(var_open_k.get())),
+                min_area=min_area_from_slider(int(var_min_area.get())),
+                enable_validation=bool(var_enable_validation.get()),
+                enable_aux_overlay=bool(var_enable_aux_overlay.get()),
+            ).normalized()
+            with self._white_bg_config_lock:
+                self._white_bg_segment_config = new_cfg
             try:
-                strength = clamp_morph_close_strength(
-                    float(str(var_strength.get()).strip())
-                )
-            except ValueError:
-                messagebox.showerror("错误", "strength 请输入数字", parent=top)
-                return
-            enabled = bool(var_enabled.get())
-            self._morph_close_lowpass_config = MorphCloseLowpassConfig(
-                enabled=enabled,
-                strength=strength,
-            )
-            try:
-                self._morph_close_lowpass_config.save(_MORPH_CLOSE_LOWPASS_CONFIG_PATH)
+                self._white_bg_segment_config.save(_WHITE_BG_SEGMENT_CONFIG_PATH)
             except Exception as e:
                 messagebox.showerror("保存失败", str(e), parent=top)
                 return
-            self._refresh_morph_close_lowpass_status_label()
-            if self._morph_close_lowpass_config.active():
-                ks = morph_close_kernel_from_strength(strength)
-                state = f"启用 strength={strength:.0f} ks={ks}"
-            elif enabled:
-                state = "已启用但 strength=0（无效果）"
-            else:
-                state = "关闭"
-            self.update_status(f"形态学闭运算已保存: {state}", "#00ff00")
+            self._refresh_white_bg_segment_status_label()
+            flags = []
+            if new_cfg.enable_validation:
+                flags.append("校验开")
+            if new_cfg.enable_aux_overlay:
+                flags.append("辅助开")
+            state = " | ".join(flags) if flags else "关"
+            self.update_status(f"白底分割已保存: {state}", "#00ff00")
             top.destroy()
 
         tk.Button(
@@ -2314,6 +2530,11 @@ class HikCameraApp:
             "check_report": ocr_data.get("check_report"),
             "paddle_raw_rec_count": ocr_data.get("paddle_raw_rec_count"),
             "paddle_boxes_after_filter": ocr_data.get("paddle_boxes_after_filter"),
+            "white_bg_validation_enabled": ocr_data.get("white_bg_validation_enabled"),
+            "white_bg_rect_xyxy": ocr_data.get("white_bg_rect_xyxy"),
+            "white_bg_rejected_boxes": ocr_data.get("white_bg_rejected_boxes"),
+            "white_bg_found": ocr_data.get("white_bg_found"),
+            "paddle_boxes_before_white_bg": ocr_data.get("paddle_boxes_before_white_bg"),
             "boxes": rows,
         }
 
@@ -2420,10 +2641,18 @@ class HikCameraApp:
             self._enter_ocr_panel_result_mode()
             self._log_decode_path_for_ocr(meta_file)
             frame_bgr = prepare_bgr_for_predict(frame_bgr)
+            white_cfg = self._get_white_bg_config_snapshot()
+            white_seg = self._segment_frame_white_bg(frame_bgr)
             t0 = time.perf_counter()
             boxes, paddle_debug = predict_boxes(
                 self.ocr_engine, frame_bgr, return_debug=True
             )
+            raw_box_count = len(boxes)
+            white_rejected = 0
+            if white_cfg.enable_validation:
+                boxes, white_rejected = filter_ocr_boxes_by_white_rect(
+                    boxes, white_seg.rect_xyxy
+                )
             pass_check, check_report = self.evaluate_production_expiry_boxes(boxes)
             self._save_ocr_debug_input_png(
                 frame_bgr, meta_file, pass_check=pass_check
@@ -2439,8 +2668,23 @@ class HikCameraApp:
                 "check_report": check_report,
                 "paddle_raw_rec_count": paddle_debug.get("raw_rec_count"),
                 "paddle_boxes_after_filter": paddle_debug.get("boxes_after_filter"),
+                "white_bg_validation_enabled": bool(white_cfg.enable_validation),
+                "white_bg_rect_xyxy": white_seg.rect_xyxy,
+                "white_bg_rejected_boxes": int(white_rejected),
+                "white_bg_found": bool(white_seg.found),
+                "paddle_boxes_before_white_bg": raw_box_count,
             }
-            vis_det = draw_detections(frame_bgr, boxes, draw_label=True)
+            if white_cfg.enable_aux_overlay:
+                vis_base = apply_aux_segment_overlay(frame_bgr, white_seg)
+            else:
+                vis_base = frame_bgr
+            vis_det = draw_detections(vis_base, boxes, draw_label=True)
+            if (
+                white_cfg.enable_validation
+                and not white_cfg.enable_aux_overlay
+                and white_seg.rect_xyxy is not None
+            ):
+                vis_det = draw_white_rect_on_bgr(vis_det, white_seg.rect_xyxy)
             vis_ocr_ui = self._draw_ok_ng_overlay(vis_det, pass_check)
 
             if persist_original_capture:
@@ -2469,6 +2713,11 @@ class HikCameraApp:
             long_texts = self.display_ocr_result(ocr_data)
             n = len(boxes)
             text_summary = f"合法文本框 {n} 个"
+            if white_cfg.enable_validation:
+                text_summary += (
+                    f"（白底校验剔除 {white_rejected} 个"
+                    f"{'，未找到白底' if not white_seg.found else ''}）"
+                )
             if long_texts:
                 text_summary += f"（列表中长度>=2 的共 {len(long_texts)} 个）"
             self.update_status(
@@ -3188,6 +3437,7 @@ class HikCameraApp:
                     bgr = cv2.cvtColor(bgr, cv2.COLOR_GRAY2BGR)
                 if bgr.ndim != 3 or bgr.shape[2] != 3:
                     return
+                bgr = self._apply_white_bg_display_overlay(bgr)
                 rgb = self._opencv_bgr_to_display_rgb(bgr)
                 img_pil = Image.fromarray(rgb)
                 img_tk = ImageTk.PhotoImage(img_pil)
@@ -3411,6 +3661,7 @@ class HikCameraApp:
 
     def run(self):
         self.update_capture_stats_display()
+        self._start_photo_storage_maintenance()
         if self._startup_auto_connect:
             self.root.after(200, self._startup_auto_connect_and_hw_trigger)
         self.root.mainloop()
