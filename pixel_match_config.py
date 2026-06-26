@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Persisted UI config for ColonCjkPhraseMatchStrategy thresholds."""
+"""Persisted UI config for OCR box pixel-dimension matching."""
 
 from __future__ import annotations
 
@@ -10,41 +10,45 @@ from typing import Any
 
 
 @dataclass
-class ColonCjkStrategyConfig:
-    enabled: bool = True
-    max_cjk_length_diff: int = 2
-    min_match_percentage_limit: float = 0.75
+class PixelMatchConfig:
+    enabled: bool = False
+    min_window_count: int = 0
+    min_pixel_width: int = 10
+    min_pixel_length: int = 20
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "enabled": bool(self.enabled),
-            "max_cjk_length_diff": int(self.max_cjk_length_diff),
-            "min_match_percentage_limit": float(self.min_match_percentage_limit),
+            "min_window_count": int(self.min_window_count),
+            "min_pixel_width": int(self.min_pixel_width),
+            "min_pixel_length": int(self.min_pixel_length),
         }
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any] | None) -> ColonCjkStrategyConfig:
+    def from_dict(cls, data: dict[str, Any] | None) -> PixelMatchConfig:
         if not data:
             return cls()
         try:
-            xd = int(data.get("max_cjk_length_diff", 2))
+            min_window_count = int(data.get("min_window_count", 0))
         except (TypeError, ValueError):
-            xd = 2
+            min_window_count = 0
         try:
-            pct = float(data.get("min_match_percentage_limit", 0.75))
+            min_pixel_width = int(data.get("min_pixel_width", 10))
         except (TypeError, ValueError):
-            pct = 0.75
-        if xd < 0:
-            xd = 0
-        pct = max(0.0, min(1.0, pct))
+            min_pixel_width = 10
+        try:
+            min_pixel_length = int(data.get("min_pixel_length", 20))
+        except (TypeError, ValueError):
+            min_pixel_length = 20
         return cls(
-            enabled=bool(data.get("enabled", True)),
-            max_cjk_length_diff=xd,
-            min_match_percentage_limit=pct,
+            enabled=bool(data.get("enabled", False)),
+            min_window_count=max(0, min_window_count),
+            min_pixel_width=max(0, min_pixel_width),
+            min_pixel_length=max(0, min_pixel_length),
         )
 
     @classmethod
-    def load(cls, path: str) -> ColonCjkStrategyConfig:
+    def load(cls, path: str) -> PixelMatchConfig:
         if not os.path.isfile(path):
             return cls()
         try:
