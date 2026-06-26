@@ -35,6 +35,7 @@ from paddle_full_image_detect import (
 )
 from relay_controller import RelayController
 from colon_cjk_strategy_config import ColonCjkStrategyConfig
+from pixel_match_config import PixelMatchConfig
 from date_check_config import DateCheckGlobalConfig
 from gaussian_lowpass import (
     GaussianLowpassConfig,
@@ -79,6 +80,9 @@ import license_manager
 _DATE_CHECK_CONFIG_PATH = os.path.join(_PROJECT_ROOT, "hik_camera_ui_date_check.json")
 _COLON_CJK_STRATEGY_CONFIG_PATH = os.path.join(
     _PROJECT_ROOT, "hik_camera_ui_colon_cjk_strategy.json"
+)
+_PIXEL_MATCH_CONFIG_PATH = os.path.join(
+    _PROJECT_ROOT, "hik_camera_ui_pixel_match.json"
 )
 _GAUSSIAN_LOWPASS_CONFIG_PATH = os.path.join(
     _PROJECT_ROOT, "hik_camera_ui_gaussian_lowpass.json"
@@ -355,9 +359,11 @@ class HikCameraApp:
             _WHITE_BG_SEGMENT_CONFIG_PATH
         )
         self._white_bg_config_lock = threading.Lock()
+        self._white_bg_dialog_preview_cfg: Optional[WhiteBgSegmentConfig] = None
         self._colon_cjk_strategy_config = ColonCjkStrategyConfig.load(
             _COLON_CJK_STRATEGY_CONFIG_PATH
         )
+        self._pixel_match_config = PixelMatchConfig.load(_PIXEL_MATCH_CONFIG_PATH)
         self._strategy_colon_cjk = ColonCjkPhraseMatchStrategy(
             max_cjk_length_diff=self._colon_cjk_strategy_config.max_cjk_length_diff,
             min_match_percentage_limit=(
@@ -517,6 +523,46 @@ class HikCameraApp:
             padx=8,
             pady=2,
         ).pack(side=tk.LEFT, padx=4)
+
+        self._colon_cjk_status_label = tk.Label(
+            strat_frame,
+            text="",
+            font=("微软雅黑", 9),
+            bg="#2b2b2b",
+            fg="#aaaaaa",
+        )
+        self._colon_cjk_status_label.pack(side=tk.LEFT, padx=(0, 6))
+
+        tk.Label(
+            strat_frame,
+            text="|",
+            font=("微软雅黑", 9),
+            bg="#2b2b2b",
+            fg="#555555",
+        ).pack(side=tk.LEFT, padx=6)
+
+        tk.Button(
+            strat_frame,
+            text="像素匹配配置",
+            command=self._open_pixel_match_config_dialog,
+            font=("微软雅黑", 9),
+            bg="#37474f",
+            fg="#ffffff",
+            padx=8,
+            pady=2,
+        ).pack(side=tk.LEFT, padx=4)
+
+        self._pixel_match_status_label = tk.Label(
+            strat_frame,
+            text="",
+            font=("微软雅黑", 9),
+            bg="#2b2b2b",
+            fg="#aaaaaa",
+        )
+        self._pixel_match_status_label.pack(side=tk.LEFT, padx=(0, 6))
+
+        self._refresh_colon_cjk_status_label()
+        self._refresh_pixel_match_status_label()
 
         tk.Label(
             strat_frame,
@@ -1445,6 +1491,38 @@ class HikCameraApp:
         except Exception as e:
             messagebox.showwarning("继电器", f"继电器动作失败: {e}")
 
+    def _refresh_colon_cjk_status_label(self) -> None:
+        lbl = getattr(self, "_colon_cjk_status_label", None)
+        if lbl is None:
+            return
+        cfg = self._colon_cjk_strategy_config
+        if cfg.enabled:
+            lbl.config(
+                text=(
+                    f"CJK: 开 (diff={cfg.max_cjk_length_diff}, "
+                    f"pct={cfg.min_match_percentage_limit:.2f})"
+                ),
+                fg="#66ccff",
+            )
+        else:
+            lbl.config(text="CJK: 关", fg="#888888")
+
+    def _refresh_pixel_match_status_label(self) -> None:
+        lbl = getattr(self, "_pixel_match_status_label", None)
+        if lbl is None:
+            return
+        cfg = self._pixel_match_config
+        if cfg.enabled:
+            lbl.config(
+                text=(
+                    f"像素: 开 (cnt>{cfg.min_window_count}, "
+                    f"宽>{cfg.min_pixel_width}, 长>{cfg.min_pixel_length})"
+                ),
+                fg="#66ccff",
+            )
+        else:
+            lbl.config(text="像素: 关", fg="#888888")
+
     def _open_colon_cjk_strategy_config_dialog(self) -> None:
         top = tk.Toplevel(self.root)
         top.title("CJK 匹配策略配置")
@@ -1453,6 +1531,7 @@ class HikCameraApp:
         top.grab_set()
 
         cfg = self._colon_cjk_strategy_config
+        var_enabled = tk.BooleanVar(value=bool(cfg.enabled))
         var_x = tk.StringVar(value=str(int(cfg.max_cjk_length_diff)))
         var_pct = tk.StringVar(value=str(float(cfg.min_match_percentage_limit)))
 
@@ -1463,6 +1542,21 @@ class HikCameraApp:
             bg="#2b2b2b",
             fg="#00ff00",
         ).pack(anchor="w", padx=12, pady=(10, 4))
+
+        enable_row = tk.Frame(top, bg="#2b2b2b")
+        enable_row.pack(fill="x", padx=12, pady=(0, 6))
+        tk.Checkbutton(
+            enable_row,
+            text="启用 CJK 匹配",
+            variable=var_enabled,
+            font=("微软雅黑", 9),
+            bg="#2b2b2b",
+            fg="#cccccc",
+            selectcolor="#1a1a1a",
+            activebackground="#2b2b2b",
+            activeforeground="#ffffff",
+            anchor="w",
+        ).pack(anchor="w")
 
         row_x = tk.Frame(top, bg="#2b2b2b")
         row_x.pack(fill="x", padx=12, pady=4)
@@ -1520,6 +1614,7 @@ class HikCameraApp:
                 messagebox.showerror("错误", "匹配率须在 0~1 之间", parent=top)
                 return
             self._colon_cjk_strategy_config = ColonCjkStrategyConfig(
+                enabled=bool(var_enabled.get()),
                 max_cjk_length_diff=xd,
                 min_match_percentage_limit=pct,
             )
@@ -1532,8 +1627,144 @@ class HikCameraApp:
                 max_cjk_length_diff=xd,
                 min_match_percentage_limit=pct,
             )
+            self._refresh_colon_cjk_status_label()
+            state = "启用" if self._colon_cjk_strategy_config.enabled else "关闭"
             self.update_status(
-                f"CJK 配置已保存: max_len_diff={xd}, min_match_pct={pct}",
+                f"CJK 配置已保存: {state}, max_len_diff={xd}, min_match_pct={pct}",
+                "#00ff00",
+            )
+            top.destroy()
+
+        tk.Button(
+            btn_row,
+            text="确定",
+            command=on_ok,
+            font=("微软雅黑", 9),
+            bg="#4CAF50",
+            fg="white",
+            padx=14,
+            pady=4,
+        ).pack(side=tk.LEFT, padx=6)
+        tk.Button(
+            btn_row,
+            text="取消",
+            command=top.destroy,
+            font=("微软雅黑", 9),
+            bg="#666666",
+            fg="white",
+            padx=14,
+            pady=4,
+        ).pack(side=tk.LEFT, padx=6)
+
+    def _open_pixel_match_config_dialog(self) -> None:
+        top = tk.Toplevel(self.root)
+        top.title("像素匹配配置")
+        top.configure(bg="#2b2b2b")
+        top.transient(self.root)
+        top.grab_set()
+        top.resizable(False, False)
+
+        cfg = self._pixel_match_config
+        var_enabled = tk.BooleanVar(value=bool(cfg.enabled))
+        var_min_count = tk.StringVar(value=str(int(cfg.min_window_count)))
+        var_min_width = tk.StringVar(value=str(int(cfg.min_pixel_width)))
+        var_min_length = tk.StringVar(value=str(int(cfg.min_pixel_length)))
+
+        tk.Label(
+            top,
+            text="像素匹配配置",
+            font=("微软雅黑", 11, "bold"),
+            bg="#2b2b2b",
+            fg="#00ff00",
+        ).pack(anchor="w", padx=12, pady=(10, 4))
+
+        tk.Label(
+            top,
+            text=(
+                "对过滤后的 PaddleOCR 文本框做像素尺寸校验。\n"
+                "宽 = 面对屏幕的垂直像素高度；长 = 面对屏幕的水平像素宽度。\n"
+                "与 CJK 同时启用时：任一通过即 OK；两者都失败才 NG。"
+            ),
+            font=("微软雅黑", 8),
+            bg="#2b2b2b",
+            fg="#888888",
+            wraplength=420,
+            justify=tk.LEFT,
+        ).pack(anchor="w", padx=12, pady=(0, 8))
+
+        enable_row = tk.Frame(top, bg="#2b2b2b")
+        enable_row.pack(fill="x", padx=12, pady=(0, 6))
+        tk.Checkbutton(
+            enable_row,
+            text="启用像素匹配",
+            variable=var_enabled,
+            font=("微软雅黑", 9),
+            bg="#2b2b2b",
+            fg="#cccccc",
+            selectcolor="#1a1a1a",
+            activebackground="#2b2b2b",
+            activeforeground="#ffffff",
+            anchor="w",
+        ).pack(anchor="w")
+
+        field_specs = [
+            ("最小窗口数", var_min_count, "文本框数量须严格大于该值"),
+            ("最小像素宽度", var_min_width, "垂直方向像素（面对屏幕的宽）"),
+            ("最小像素长度", var_min_length, "水平方向像素（面对屏幕的长）"),
+        ]
+        for label, var, hint in field_specs:
+            row = tk.Frame(top, bg="#2b2b2b")
+            row.pack(fill="x", padx=12, pady=4)
+            tk.Label(
+                row,
+                text=f"{label}:",
+                font=("微软雅黑", 9),
+                bg="#2b2b2b",
+                fg="#cccccc",
+                width=14,
+                anchor="w",
+            ).pack(side=tk.LEFT)
+            tk.Entry(row, textvariable=var, width=10, font=("微软雅黑", 9)).pack(
+                side=tk.LEFT, padx=4
+            )
+            tk.Label(
+                row,
+                text=hint,
+                font=("微软雅黑", 8),
+                bg="#2b2b2b",
+                fg="#888888",
+            ).pack(side=tk.LEFT, padx=4)
+
+        btn_row = tk.Frame(top, bg="#2b2b2b")
+        btn_row.pack(pady=14)
+
+        def on_ok() -> None:
+            try:
+                min_count = int(str(var_min_count.get()).strip())
+                min_width = int(str(var_min_width.get()).strip())
+                min_length = int(str(var_min_length.get()).strip())
+            except ValueError:
+                messagebox.showerror("错误", "请输入整数", parent=top)
+                return
+            if min_count < 0 or min_width < 0 or min_length < 0:
+                messagebox.showerror("错误", "参数须 >= 0", parent=top)
+                return
+            self._pixel_match_config = PixelMatchConfig(
+                enabled=bool(var_enabled.get()),
+                min_window_count=min_count,
+                min_pixel_width=min_width,
+                min_pixel_length=min_length,
+            )
+            try:
+                self._pixel_match_config.save(_PIXEL_MATCH_CONFIG_PATH)
+            except Exception as e:
+                messagebox.showerror("保存失败", str(e), parent=top)
+                return
+            self._refresh_pixel_match_status_label()
+            state = "启用" if self._pixel_match_config.enabled else "关闭"
+            self.update_status(
+                f"像素匹配已保存: {state}, cnt>{min_count}, "
+                f"宽>{min_width}, 长>{min_length}",
                 "#00ff00",
             )
             top.destroy()
@@ -1723,19 +1954,61 @@ class HikCameraApp:
 
     def _get_white_bg_config_snapshot(self) -> WhiteBgSegmentConfig:
         with self._white_bg_config_lock:
-            return WhiteBgSegmentConfig.from_dict(self._white_bg_segment_config.to_dict())
+            if self._white_bg_dialog_preview_cfg is not None:
+                return WhiteBgSegmentConfig.from_dict(
+                    self._white_bg_dialog_preview_cfg.to_dict()
+                )
+            return WhiteBgSegmentConfig.from_dict(
+                self._white_bg_segment_config.to_dict()
+            )
+
+    def _set_white_bg_dialog_preview_cfg(
+        self, cfg: Optional[WhiteBgSegmentConfig]
+    ) -> None:
+        with self._white_bg_config_lock:
+            self._white_bg_dialog_preview_cfg = (
+                cfg.normalized() if cfg is not None else None
+            )
+
+    def _white_bg_dialog_preview_active(self) -> bool:
+        with self._white_bg_config_lock:
+            return self._white_bg_dialog_preview_cfg is not None
+
+    def _repaint_white_bg_preview_frame(self) -> None:
+        """Refresh live preview after dialog slider/checkbox changes."""
+        with self.frame_lock:
+            frame = (
+                self.current_frame.copy()
+                if self.current_frame is not None
+                else None
+            )
+        if frame is None or frame.size == 0:
+            return
+        if self._ocr_panel_mode == _OCR_PANEL_LIVE:
+            self._apply_live_to_ocr_panel(frame)
+        elif _SHOW_CAMERA_PREVIEW and self.video_label is not None:
+            self._apply_video_preview(frame)
 
     def _segment_frame_white_bg(self, frame_bgr: np.ndarray):
         return segment_white_background(frame_bgr, self._get_white_bg_config_snapshot())
 
     def _apply_white_bg_display_overlay(self, frame_bgr: np.ndarray) -> np.ndarray:
         cfg = self._get_white_bg_config_snapshot()
-        if not cfg.enable_aux_overlay:
-            return frame_bgr
         if frame_bgr is None or frame_bgr.size == 0:
             return frame_bgr
-        seg = self._segment_frame_white_bg(frame_bgr)
-        return apply_aux_segment_overlay(frame_bgr, seg)
+        dialog_preview = self._white_bg_dialog_preview_active()
+        if not dialog_preview and not cfg.enable_aux_overlay:
+            if cfg.enable_validation:
+                seg = segment_white_background(frame_bgr, cfg)
+                if seg.rect_xyxy is not None:
+                    return draw_white_rect_on_bgr(frame_bgr, seg.rect_xyxy)
+            return frame_bgr
+        seg = segment_white_background(frame_bgr, cfg)
+        if dialog_preview or cfg.enable_aux_overlay:
+            return apply_aux_segment_overlay(frame_bgr, seg)
+        if cfg.enable_validation and seg.rect_xyxy is not None:
+            return draw_white_rect_on_bgr(frame_bgr, seg.rect_xyxy)
+        return frame_bgr
 
     def _refresh_white_bg_segment_status_label(self) -> None:
         lbl = getattr(self, "_white_bg_segment_status_label", None)
@@ -1788,7 +2061,7 @@ class HikCameraApp:
             top,
             text=(
                 "HSV 阈值 + 形态学生成白底矩形；开启校验后仅保留落在该矩形内的 PaddleOCR 文本框。\n"
-                "开启辅助配置后，预览/OCR 图像叠加浅色掩膜与矩形，便于理解分割结果。"
+                "拖动滑条或勾选选项时，识别结果图像会实时预览分割效果；点击「保存」后写入配置文件并关闭预览。"
             ),
             font=("微软雅黑", 8),
             bg="#2b2b2b",
@@ -1799,6 +2072,33 @@ class HikCameraApp:
 
         body = tk.Frame(top, bg="#2b2b2b")
         body.pack(fill="both", expand=True, padx=14)
+
+        def _build_cfg_from_vars() -> WhiteBgSegmentConfig:
+            return WhiteBgSegmentConfig(
+                h_min=clamp_h(int(var_h_min.get())),
+                h_max=clamp_h(int(var_h_max.get())),
+                s_min=clamp_sv(int(var_s_min.get())),
+                s_max=clamp_sv(int(var_s_max.get())),
+                v_min=clamp_sv(int(var_v_min.get())),
+                v_max=clamp_sv(int(var_v_max.get())),
+                close_k=clamp_close_k(int(var_close_k.get())),
+                open_k=clamp_open_k(int(var_open_k.get())),
+                min_area=min_area_from_slider(int(var_min_area.get())),
+                enable_validation=bool(var_enable_validation.get()),
+                enable_aux_overlay=bool(var_enable_aux_overlay.get()),
+            ).normalized()
+
+        def _push_dialog_preview() -> None:
+            self._set_white_bg_dialog_preview_cfg(_build_cfg_from_vars())
+            self._repaint_white_bg_preview_frame()
+
+        def _close_dialog(*, saved: bool) -> None:
+            self._set_white_bg_dialog_preview_cfg(None)
+            self._repaint_white_bg_preview_frame()
+            if saved:
+                top.destroy()
+                return
+            top.destroy()
 
         slider_specs = [
             ("H_min", var_h_min, 0, 179),
@@ -1862,9 +2162,15 @@ class HikCameraApp:
                 fg="#cccccc",
                 troughcolor="#1a1a1a",
                 highlightthickness=0,
-                command=lambda _v, n=name, vr=var: _sync_value_label(n, vr),
+                command=lambda _v, n=name, vr=var: (
+                    _sync_value_label(n, vr),
+                    _push_dialog_preview(),
+                ),
             ).pack(side=tk.LEFT, padx=(6, 8))
             _sync_value_label(name, var)
+
+        def _on_flag_changed(*_args: object) -> None:
+            _push_dialog_preview()
 
         flag_row = tk.Frame(body, bg="#2b2b2b")
         flag_row.pack(fill="x", pady=(12, 4))
@@ -1872,6 +2178,7 @@ class HikCameraApp:
             flag_row,
             text="开启白底校验（OCR 文本框须在白底矩形内）",
             variable=var_enable_validation,
+            command=_on_flag_changed,
             font=("微软雅黑", 9),
             bg="#2b2b2b",
             fg="#cccccc",
@@ -1884,6 +2191,7 @@ class HikCameraApp:
             flag_row,
             text="开启辅助配置（预览/OCR 图叠加浅色白底掩膜与矩形）",
             variable=var_enable_aux_overlay,
+            command=_on_flag_changed,
             font=("微软雅黑", 9),
             bg="#2b2b2b",
             fg="#cccccc",
@@ -1893,23 +2201,14 @@ class HikCameraApp:
             anchor="w",
         ).pack(anchor="w", pady=(4, 0))
 
+        self._set_white_bg_dialog_preview_cfg(_build_cfg_from_vars())
+        self._repaint_white_bg_preview_frame()
+
         btn_row = tk.Frame(top, bg="#2b2b2b")
         btn_row.pack(pady=(16, 14), padx=14)
 
         def on_save() -> None:
-            new_cfg = WhiteBgSegmentConfig(
-                h_min=clamp_h(int(var_h_min.get())),
-                h_max=clamp_h(int(var_h_max.get())),
-                s_min=clamp_sv(int(var_s_min.get())),
-                s_max=clamp_sv(int(var_s_max.get())),
-                v_min=clamp_sv(int(var_v_min.get())),
-                v_max=clamp_sv(int(var_v_max.get())),
-                close_k=clamp_close_k(int(var_close_k.get())),
-                open_k=clamp_open_k(int(var_open_k.get())),
-                min_area=min_area_from_slider(int(var_min_area.get())),
-                enable_validation=bool(var_enable_validation.get()),
-                enable_aux_overlay=bool(var_enable_aux_overlay.get()),
-            ).normalized()
+            new_cfg = _build_cfg_from_vars()
             with self._white_bg_config_lock:
                 self._white_bg_segment_config = new_cfg
             try:
@@ -1925,7 +2224,12 @@ class HikCameraApp:
                 flags.append("辅助开")
             state = " | ".join(flags) if flags else "关"
             self.update_status(f"白底分割已保存: {state}", "#00ff00")
-            top.destroy()
+            _close_dialog(saved=True)
+
+        def on_cancel() -> None:
+            _close_dialog(saved=False)
+
+        top.protocol("WM_DELETE_WINDOW", on_cancel)
 
         tk.Button(
             btn_row,
@@ -1940,7 +2244,7 @@ class HikCameraApp:
         tk.Button(
             btn_row,
             text="取消",
-            command=top.destroy,
+            command=on_cancel,
             font=("微软雅黑", 10),
             bg="#555555",
             fg="white",
@@ -2119,6 +2423,8 @@ class HikCameraApp:
             strategy=self._strategy_colon_cjk,
             strategy_cfg=strategy_cfg,
             date_cfg=self._date_check_config,
+            boxes=boxes,
+            pixel_cfg=self._pixel_match_config,
         )
         self._last_check_report = report
 
@@ -2126,7 +2432,10 @@ class HikCameraApp:
             "[HikCameraApp] ocr_check "
             f"verdict={report.get('verdict')} "
             f"strategy=ColonCjkPhraseMatchStrategy "
+            f"strategy_enabled={strategy_cfg.get('enabled')} "
             f"strategy_params={report.get('strategy', {}).get('params')} "
+            f"pixel_match_enabled={self._pixel_match_config.enabled} "
+            f"pixel_match_pass={report.get('pixel_match', {}).get('passed')} "
             f"enable_date_check={self._date_check_config.enable_date_check} "
             f"ng_trigger={report.get('ng_trigger')}",
             flush=True,
