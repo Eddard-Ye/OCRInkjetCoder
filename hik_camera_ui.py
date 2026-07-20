@@ -75,7 +75,11 @@ from white_bg_segment import (
 )
 from ocr_check_report import build_ocr_check_report, format_check_report_for_ui
 from production_phrase_strategy import ColonCjkPhraseMatchStrategy
+from hik_camera_auth import AuthStore, DEFAULT_PASSWORD
 import license_manager
+
+_AUTH_SESSION_TIMEOUT_SEC = 30 * 60
+_AUTH_IDLE_CHECK_MS = 15_000
 
 _DATE_CHECK_CONFIG_PATH = os.path.join(_PROJECT_ROOT, "hik_camera_ui_date_check.json")
 _COLON_CJK_STRATEGY_CONFIG_PATH = os.path.join(
@@ -382,6 +386,15 @@ class HikCameraApp:
 
         self._last_check_report: Optional[Dict[str, Any]] = None
 
+        self._auth_store = AuthStore.default()
+        try:
+            self._auth_store.ensure_initialized(DEFAULT_PASSWORD)
+        except Exception as e:
+            print(f"[HikCameraApp] auth init failed: {e}", flush=True)
+        self._auth_logged_in = False
+        self._auth_last_active_monotonic = 0.0
+        self._auth_idle_after_id: Optional[str] = None
+
         self.setup_ui()
         self.protocol()
         self._load_stats_from_disk()
@@ -391,6 +404,9 @@ class HikCameraApp:
             self._license_info = license_manager.check_license()
         except license_manager.LicenseError:
             self._license_info = None
+        self._refresh_auth_ui()
+        self._bind_auth_activity_hooks()
+        self._schedule_auth_idle_check()
 
     def setup_ui(self):
         self.license_runtime_label = tk.Label(
@@ -413,8 +429,46 @@ class HikCameraApp:
         )
         title_label.pack(pady=10)
 
+        auth_bar = tk.Frame(self.root, bg="#2b2b2b")
+        auth_bar.pack(pady=(0, 4), fill="x", padx=10)
+
+        self._auth_status_label = tk.Label(
+            auth_bar,
+            text="权限: 未登录",
+            font=("微软雅黑", 9),
+            bg="#2b2b2b",
+            fg="#ffaa66",
+            anchor="w",
+        )
+        self._auth_status_label.pack(side=tk.LEFT)
+
+        self.btn_auth_logout = tk.Button(
+            auth_bar,
+            text="退出登录",
+            command=self._auth_logout_clicked,
+            font=("微软雅黑", 9),
+            bg="#555555",
+            fg="#ffffff",
+            padx=8,
+            pady=2,
+        )
+        self.btn_auth_logout.pack(side=tk.RIGHT, padx=(4, 0))
+
+        self.btn_auth_login = tk.Button(
+            auth_bar,
+            text="登录 / 改密",
+            command=self._open_auth_login_dialog,
+            font=("微软雅黑", 9),
+            bg="#1565C0",
+            fg="#ffffff",
+            padx=8,
+            pady=2,
+        )
+        self.btn_auth_login.pack(side=tk.RIGHT)
+
         control_frame = tk.Frame(self.root, bg="#2b2b2b")
         control_frame.pack(pady=5)
+        self._control_frame = control_frame
 
         btn_style = {
             "font": ("微软雅黑", 10),
@@ -502,8 +556,9 @@ class HikCameraApp:
         )
         self.btn_toggle_trigger.grid(row=1, column=0, columnspan=6, padx=5, pady=(0, 5))
 
-        strat_frame = tk.Frame(control_frame.master, bg="#2b2b2b")
+        strat_frame = tk.Frame(self.root, bg="#2b2b2b")
         strat_frame.pack(pady=(0, 4), fill="x", padx=10)
+        self._auth_strat_frame = strat_frame
 
         tk.Label(
             strat_frame,
@@ -816,6 +871,264 @@ class HikCameraApp:
 
     def protocol(self):
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+
+    def _auth_touch(self, *_args: Any) -> None:
+        if self._auth_logged_in:
+            self._auth_last_active_monotonic = time.monotonic()
+
+    def _bind_auth_activity_hooks(self) -> None:
+        self.root.bind_all("<Button-1>", self._auth_touch, add="+")
+        self.root.bind_all("<Key>", self._auth_touch, add="+")
+
+    def _schedule_auth_idle_check(self) -> None:
+        if self._auth_idle_after_id is not None:
+            try:
+                self.root.after_cancel(self._auth_idle_after_id)
+            except Exception:
+                pass
+        self._auth_idle_after_id = self.root.after(
+            _AUTH_IDLE_CHECK_MS, self._auth_idle_tick
+        )
+
+    def _auth_idle_tick(self) -> None:
+        self._auth_idle_after_id = None
+        try:
+            if self._auth_logged_in:
+                idle = time.monotonic() - float(self._auth_last_active_monotonic)
+                if idle >= float(_AUTH_SESSION_TIMEOUT_SEC):
+                    self._auth_logout(reason="timeout")
+        finally:
+            self._schedule_auth_idle_check()
+
+    def _auth_login_success(self) -> None:
+        self._auth_logged_in = True
+        self._auth_last_active_monotonic = time.monotonic()
+        self._refresh_auth_ui()
+
+    def _auth_logout(self, *, reason: str = "manual") -> None:
+        was = self._auth_logged_in
+        self._auth_logged_in = False
+        self._auth_last_active_monotonic = 0.0
+        self._refresh_auth_ui()
+        if was and reason == "timeout":
+            try:
+                messagebox.showinfo("登录超时", "已超过 30 分钟无操作，已自动退出登录。")
+            except Exception:
+                pass
+
+    def _auth_logout_clicked(self) -> None:
+        self._auth_touch()
+        if not self._auth_logged_in:
+            return
+        self._auth_logout(reason="manual")
+
+    def _refresh_auth_ui(self) -> None:
+        logged_in = bool(self._auth_logged_in)
+        lbl = getattr(self, "_auth_status_label", None)
+        if lbl is not None:
+            if logged_in:
+                lbl.config(text="权限: 已登录", fg="#66ff66")
+            else:
+                lbl.config(text="权限: 未登录（访客模式）", fg="#ffaa66")
+
+        btn_out = getattr(self, "btn_auth_logout", None)
+        if btn_out is not None:
+            btn_out.config(state=("normal" if logged_in else "disabled"))
+
+        restricted_grid = [
+            getattr(self, "btn_config_camera", None),
+            getattr(self, "btn_date_check_config", None),
+            getattr(self, "btn_toggle_trigger", None),
+        ]
+        for w in restricted_grid:
+            if w is None:
+                continue
+            try:
+                if logged_in:
+                    info = w.grid_info()
+                    if not info:
+                        if w is self.btn_toggle_trigger:
+                            w.grid(
+                                row=1,
+                                column=0,
+                                columnspan=6,
+                                padx=5,
+                                pady=(0, 5),
+                            )
+                        elif w is self.btn_config_camera:
+                            w.grid(row=0, column=4, padx=5, pady=5)
+                        elif w is self.btn_date_check_config:
+                            w.grid(row=0, column=5, padx=5, pady=5)
+                else:
+                    w.grid_remove()
+            except Exception:
+                pass
+
+        strat = getattr(self, "_auth_strat_frame", None)
+        control = getattr(self, "_control_frame", None)
+        if strat is not None:
+            try:
+                if logged_in:
+                    if not strat.winfo_manager():
+                        if control is not None:
+                            strat.pack(
+                                after=control,
+                                pady=(0, 4),
+                                fill="x",
+                                padx=10,
+                            )
+                        else:
+                            strat.pack(pady=(0, 4), fill="x", padx=10)
+                else:
+                    strat.pack_forget()
+            except Exception:
+                pass
+
+        # Re-apply camera-dependent button states after show/hide.
+        if logged_in and self.b_open_device:
+            try:
+                self.btn_config_camera.config(state="normal")
+                self.btn_toggle_trigger.config(state="normal")
+            except Exception:
+                pass
+        elif logged_in:
+            try:
+                self.btn_config_camera.config(state="disabled")
+                self.btn_toggle_trigger.config(state="disabled")
+            except Exception:
+                pass
+
+    def _require_auth(self, action: str = "该操作") -> bool:
+        self._auth_touch()
+        if self._auth_logged_in:
+            return True
+        messagebox.showwarning(
+            "需要登录",
+            f"{action}需要管理员登录后才能使用。\n请点击「登录 / 改密」。",
+        )
+        return False
+
+    def _open_auth_login_dialog(self) -> None:
+        self._auth_touch()
+        top = tk.Toplevel(self.root)
+        top.title("管理员登录")
+        top.configure(bg="#2b2b2b")
+        top.transient(self.root)
+        top.grab_set()
+        top.resizable(False, False)
+
+        tk.Label(
+            top,
+            text="管理员登录 / 修改密码",
+            font=("微软雅黑", 11, "bold"),
+            bg="#2b2b2b",
+            fg="#00ff00",
+        ).pack(anchor="w", padx=12, pady=(10, 6))
+
+        notebook = ttk.Notebook(top)
+        notebook.pack(fill="both", expand=True, padx=10, pady=4)
+
+        tab_login = tk.Frame(notebook, bg="#2b2b2b")
+        tab_pwd = tk.Frame(notebook, bg="#2b2b2b")
+        notebook.add(tab_login, text="登录")
+        notebook.add(tab_pwd, text="修改密码")
+
+        var_login_pwd = tk.StringVar()
+        row = tk.Frame(tab_login, bg="#2b2b2b")
+        row.pack(fill="x", padx=12, pady=10)
+        tk.Label(
+            row,
+            text="密码:",
+            font=("微软雅黑", 9),
+            bg="#2b2b2b",
+            fg="#cccccc",
+            width=10,
+            anchor="w",
+        ).pack(side=tk.LEFT)
+        ent_login = tk.Entry(
+            row, textvariable=var_login_pwd, show="*", width=24, font=("微软雅黑", 9)
+        )
+        ent_login.pack(side=tk.LEFT, padx=4)
+        ent_login.focus_set()
+
+        def do_login() -> None:
+            pwd = str(var_login_pwd.get() or "")
+            if not self._auth_store.verify(pwd):
+                messagebox.showerror("登录失败", "密码不正确", parent=top)
+                return
+            self._auth_login_success()
+            top.destroy()
+
+        tk.Button(
+            tab_login,
+            text="确认登录",
+            command=do_login,
+            bg="#4CAF50",
+            fg="white",
+            font=("微软雅黑", 9),
+            padx=12,
+            pady=4,
+        ).pack(pady=(4, 12))
+
+        var_old = tk.StringVar()
+        var_new = tk.StringVar()
+        var_new2 = tk.StringVar()
+        for label, var in (
+            ("旧密码:", var_old),
+            ("新密码:", var_new),
+            ("确认新密码:", var_new2),
+        ):
+            r = tk.Frame(tab_pwd, bg="#2b2b2b")
+            r.pack(fill="x", padx=12, pady=4)
+            tk.Label(
+                r,
+                text=label,
+                font=("微软雅黑", 9),
+                bg="#2b2b2b",
+                fg="#cccccc",
+                width=12,
+                anchor="w",
+            ).pack(side=tk.LEFT)
+            tk.Entry(
+                r, textvariable=var, show="*", width=22, font=("微软雅黑", 9)
+            ).pack(side=tk.LEFT, padx=4)
+
+        def do_change() -> None:
+            new_pwd = str(var_new.get() or "")
+            if new_pwd != str(var_new2.get() or ""):
+                messagebox.showerror("错误", "两次输入的新密码不一致", parent=top)
+                return
+            ok, msg = self._auth_store.change_password(str(var_old.get() or ""), new_pwd)
+            if not ok:
+                zh = {
+                    "new password empty": "新密码不能为空",
+                    "old password incorrect": "旧密码不正确",
+                }.get(msg, msg or "无法修改密码")
+                messagebox.showerror("修改失败", zh, parent=top)
+                return
+            messagebox.showinfo("成功", "密码已更新，请使用新密码登录。", parent=top)
+            notebook.select(tab_login)
+
+        tk.Button(
+            tab_pwd,
+            text="保存新密码",
+            command=do_change,
+            bg="#1565C0",
+            fg="white",
+            font=("微软雅黑", 9),
+            padx=12,
+            pady=4,
+        ).pack(pady=(8, 12))
+
+        tk.Label(
+            top,
+            text=f"首次安装默认密码: {DEFAULT_PASSWORD}（请尽快修改）",
+            font=("微软雅黑", 8),
+            bg="#2b2b2b",
+            fg="#888888",
+        ).pack(anchor="w", padx=12, pady=(0, 8))
+
+        top.bind("<Return>", lambda _e: do_login())
 
     def _pack_ocr_preview_and_ng_panel(self, parent: tk.Widget) -> None:
         """左侧/嵌套区：当前 OCR 渲染图 + 底部 NG 文件列表。"""
@@ -1524,6 +1837,8 @@ class HikCameraApp:
             lbl.config(text="像素: 关", fg="#888888")
 
     def _open_colon_cjk_strategy_config_dialog(self) -> None:
+        if not self._require_auth("编辑 CJK 配置"):
+            return
         top = tk.Toplevel(self.root)
         top.title("CJK 匹配策略配置")
         top.configure(bg="#2b2b2b")
@@ -1657,6 +1972,8 @@ class HikCameraApp:
         ).pack(side=tk.LEFT, padx=6)
 
     def _open_pixel_match_config_dialog(self) -> None:
+        if not self._require_auth("像素匹配配置"):
+            return
         top = tk.Toplevel(self.root)
         top.title("像素匹配配置")
         top.configure(bg="#2b2b2b")
@@ -1808,6 +2125,8 @@ class HikCameraApp:
         lbl.config(text=text, fg=fg)
 
     def _open_gaussian_lowpass_config_dialog(self) -> None:
+        if not self._require_auth("高斯滤波配置"):
+            return
         top = tk.Toplevel(self.root)
         top.title("高斯滤波配置")
         top.configure(bg="#2b2b2b")
@@ -2023,6 +2342,8 @@ class HikCameraApp:
         lbl.config(text=text, fg=fg)
 
     def _open_white_bg_segment_config_dialog(self) -> None:
+        if not self._require_auth("白底分割配置"):
+            return
         top = tk.Toplevel(self.root)
         top.title("白底分割配置")
         top.configure(bg="#2b2b2b")
@@ -2274,6 +2595,8 @@ class HikCameraApp:
             pass
 
     def _open_date_check_config_dialog(self) -> None:
+        if not self._require_auth("日期检测参数"):
+            return
         top = tk.Toplevel(self.root)
         top.title("日期检测全局配置")
         top.configure(bg="#2b2b2b")
@@ -3038,6 +3361,8 @@ class HikCameraApp:
 
     def toggle_hardware_trigger_mode(self) -> None:
         """Switch between continuous preview and Line0 hardware trigger (saves JPEG on each frame)."""
+        if not self._require_auth("切换硬触发"):
+            return
         if not self.b_open_device:
             messagebox.showwarning("提示", "请先连接相机。")
             return
@@ -3423,6 +3748,8 @@ class HikCameraApp:
         return errors
 
     def open_camera_config_dialog(self) -> None:
+        if not self._require_auth("配置相机"):
+            return
         if not self.b_open_device:
             messagebox.showwarning("配置相机", "请先连接相机。")
             return
@@ -3700,6 +4027,7 @@ class HikCameraApp:
         self.btn_disconnect.config(state="normal")
         self.btn_capture.config(state="normal")
         self.btn_config_camera.config(state="normal")
+        self._refresh_auth_ui()
 
         self.update_status("相机已连接，正在采集...", "#00ff00")
 
@@ -3907,6 +4235,7 @@ class HikCameraApp:
         self.btn_disconnect.config(state="disabled")
         self.btn_capture.config(state="disabled")
         self.btn_config_camera.config(state="disabled")
+        self._refresh_auth_ui()
         if self.video_label is not None:
             self.video_label.config(image="", text="相机预览区域")
             self.video_label.image = None
@@ -3945,6 +4274,12 @@ class HikCameraApp:
         if not self.b_open_device:
             return
         if self._startup_hardware_trigger and not self.use_hw_trigger:
+            if not self._auth_logged_in:
+                print(
+                    "[HikCameraApp] startup hard-trigger skipped (not logged in)",
+                    flush=True,
+                )
+                return
             self.toggle_hardware_trigger_mode()
 
     def run(self):
