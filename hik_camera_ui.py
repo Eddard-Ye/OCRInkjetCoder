@@ -356,6 +356,12 @@ class HikCameraApp:
         self._gaussian_lowpass_config = GaussianLowpassConfig.load(
             _GAUSSIAN_LOWPASS_CONFIG_PATH
         )
+        # Debug dump mode is not exposed in UI; keep it off.
+        if bool(self._gaussian_lowpass_config.debug_mode):
+            self._gaussian_lowpass_config = GaussianLowpassConfig(
+                sigma=float(self._gaussian_lowpass_config.sigma),
+                debug_mode=False,
+            )
         self._morph_close_lowpass_config = MorphCloseLowpassConfig.load(
             _MORPH_CLOSE_LOWPASS_CONFIG_PATH
         )
@@ -531,16 +537,6 @@ class HikCameraApp:
         )
         self.btn_config_camera.grid(row=0, column=4, padx=5, pady=5)
 
-        self.btn_date_check_config = tk.Button(
-            control_frame,
-            text="日期检测参数",
-            command=self._open_date_check_config_dialog,
-            bg="#009688",
-            fg="white",
-            **btn_style,
-        )
-        self.btn_date_check_config.grid(row=0, column=5, padx=5, pady=5)
-
         self.btn_toggle_trigger = tk.Button(
             control_frame,
             text="切换到硬触发(Line0)",
@@ -554,7 +550,7 @@ class HikCameraApp:
             relief="raised",
             bd=2,
         )
-        self.btn_toggle_trigger.grid(row=1, column=0, columnspan=6, padx=5, pady=(0, 5))
+        self.btn_toggle_trigger.grid(row=1, column=0, columnspan=5, padx=5, pady=(0, 5))
 
         strat_frame = tk.Frame(self.root, bg="#2b2b2b")
         strat_frame.pack(pady=(0, 4), fill="x", padx=10)
@@ -937,7 +933,6 @@ class HikCameraApp:
 
         restricted_grid = [
             getattr(self, "btn_config_camera", None),
-            getattr(self, "btn_date_check_config", None),
             getattr(self, "btn_toggle_trigger", None),
         ]
         for w in restricted_grid:
@@ -951,14 +946,12 @@ class HikCameraApp:
                             w.grid(
                                 row=1,
                                 column=0,
-                                columnspan=6,
+                                columnspan=5,
                                 padx=5,
                                 pady=(0, 5),
                             )
                         elif w is self.btn_config_camera:
                             w.grid(row=0, column=4, padx=5, pady=5)
-                        elif w is self.btn_date_check_config:
-                            w.grid(row=0, column=5, padx=5, pady=5)
                 else:
                     w.grid_remove()
             except Exception:
@@ -2112,16 +2105,12 @@ class HikCameraApp:
         if lbl is None:
             return
         sig = float(self._gaussian_lowpass_config.sigma)
-        debug = bool(self._gaussian_lowpass_config.debug_mode)
         if sig > 0:
             text = f"高斯滤波: 开 (σ={sig:.2f})"
             fg = "#66ccff"
         else:
             text = "高斯滤波: 关 (σ=0)"
             fg = "#888888"
-        if debug:
-            text += " | 调试存原图"
-            fg = "#ffcc66"
         lbl.config(text=text, fg=fg)
 
     def _open_gaussian_lowpass_config_dialog(self) -> None:
@@ -2136,7 +2125,6 @@ class HikCameraApp:
 
         cfg = self._gaussian_lowpass_config
         var_sigma = tk.StringVar(value=f"{float(cfg.sigma):.2f}")
-        var_debug = tk.BooleanVar(value=bool(cfg.debug_mode))
 
         tk.Label(
             top,
@@ -2182,29 +2170,6 @@ class HikCameraApp:
             justify="center",
         ).pack(side=tk.LEFT, padx=4)
 
-        debug_row = tk.Frame(top, bg="#2b2b2b")
-        debug_row.pack(fill="x", padx=14, pady=(10, 4))
-        tk.Checkbutton(
-            debug_row,
-            text="调试模式（仅 NG 时另存喂入 OCR 的原图，PNG 无损）",
-            variable=var_debug,
-            font=("微软雅黑", 9),
-            bg="#2b2b2b",
-            fg="#cccccc",
-            selectcolor="#1a1a1a",
-            activebackground="#2b2b2b",
-            activeforeground="#ffffff",
-            anchor="w",
-        ).pack(anchor="w")
-        tk.Label(
-            debug_row,
-            text=f"保存目录: {self.ocr_output_dir}/debug/{{日期}}/",
-            font=("微软雅黑", 8),
-            bg="#2b2b2b",
-            fg="#666666",
-            anchor="w",
-        ).pack(anchor="w", pady=(2, 0))
-
         btn_row = tk.Frame(top, bg="#2b2b2b")
         btn_row.pack(pady=(16, 14), padx=14)
 
@@ -2214,10 +2179,9 @@ class HikCameraApp:
             except ValueError:
                 messagebox.showerror("错误", "σ 请输入数字", parent=top)
                 return
-            debug_mode = bool(var_debug.get())
             self._gaussian_lowpass_config = GaussianLowpassConfig(
                 sigma=sigma,
-                debug_mode=debug_mode,
+                debug_mode=False,
             )
             try:
                 self._gaussian_lowpass_config.save(_GAUSSIAN_LOWPASS_CONFIG_PATH)
@@ -2226,9 +2190,8 @@ class HikCameraApp:
                 return
             self._refresh_gaussian_lowpass_status_label()
             state = "启用" if sigma > 0 else "关闭"
-            dbg = "开" if debug_mode else "关"
             self.update_status(
-                f"高斯滤波已保存: {state} σ={sigma:.2f} | 调试模式: {dbg}",
+                f"高斯滤波已保存: {state} σ={sigma:.2f}",
                 "#00ff00",
             )
             top.destroy()
@@ -2593,122 +2556,6 @@ class HikCameraApp:
             threading.Thread(target=_worker, daemon=True).start()
         except Exception:
             pass
-
-    def _open_date_check_config_dialog(self) -> None:
-        if not self._require_auth("日期检测参数"):
-            return
-        top = tk.Toplevel(self.root)
-        top.title("日期检测全局配置")
-        top.configure(bg="#2b2b2b")
-        top.transient(self.root)
-        top.grab_set()
-        top.resizable(False, False)
-
-        cfg = self._date_check_config
-        var_enable = tk.BooleanVar(value=bool(cfg.enable_date_check))
-        var_normal = tk.StringVar(value=str(int(cfg.shelf_life_normal)))
-        var_frozen = tk.StringVar(value=str(int(cfg.shelf_life_frozen)))
-
-        tk.Label(
-            top,
-            text="日期检测全局配置",
-            font=("微软雅黑", 11, "bold"),
-            bg="#2b2b2b",
-            fg="#00ff00",
-        ).pack(anchor="w", padx=14, pady=(12, 8))
-
-        tk.Checkbutton(
-            top,
-            text="启用日期检测",
-            variable=var_enable,
-            font=("微软雅黑", 10),
-            bg="#2b2b2b",
-            fg="#eeeeee",
-            selectcolor="#444444",
-            activebackground="#2b2b2b",
-            activeforeground="#ffffff",
-        ).pack(anchor="w", padx=14, pady=6)
-
-        tk.Label(
-            top,
-            text="启用后：须有三行 OCR 文本分别解析为「今天 / 今天+常温天数 / 今天+冷冻天数」",
-            font=("微软雅黑", 8),
-            bg="#2b2b2b",
-            fg="#888888",
-            wraplength=360,
-            justify=tk.LEFT,
-        ).pack(anchor="w", padx=14, pady=(0, 8))
-
-        def _spin_row(parent: tk.Widget, label: str, var: tk.StringVar) -> None:
-            row = tk.Frame(parent, bg="#2b2b2b")
-            row.pack(fill="x", padx=14, pady=6)
-            tk.Label(
-                row,
-                text=label,
-                font=("微软雅黑", 9),
-                bg="#2b2b2b",
-                fg="#cccccc",
-                width=22,
-                anchor="w",
-            ).pack(side=tk.LEFT)
-            tk.Spinbox(
-                row,
-                from_=0,
-                to=9999,
-                textvariable=var,
-                width=8,
-                font=("微软雅黑", 10),
-                justify="center",
-            ).pack(side=tk.LEFT, padx=4)
-
-        _spin_row(top, "常温存储保质期（天）", var_normal)
-        _spin_row(top, "冷冻存储保质期（天）", var_frozen)
-
-        btn_row = tk.Frame(top, bg="#2b2b2b")
-        btn_row.pack(pady=(16, 14), padx=14)
-
-        def on_save() -> None:
-            try:
-                normal_d = int(str(var_normal.get()).strip())
-                frozen_d = int(str(var_frozen.get()).strip())
-            except ValueError:
-                messagebox.showerror("错误", "保质期天数请输入整数", parent=top)
-                return
-            if normal_d < 0 or frozen_d < 0:
-                messagebox.showerror("错误", "保质期天数须 >= 0", parent=top)
-                return
-            self._date_check_config = DateCheckGlobalConfig(
-                enable_date_check=bool(var_enable.get()),
-                shelf_life_normal=normal_d,
-                shelf_life_frozen=frozen_d,
-            )
-            try:
-                self._date_check_config.save(_DATE_CHECK_CONFIG_PATH)
-            except Exception as e:
-                messagebox.showerror("保存失败", str(e), parent=top)
-                return
-            top.destroy()
-
-        tk.Button(
-            btn_row,
-            text="保存",
-            command=on_save,
-            font=("微软雅黑", 9),
-            bg="#4CAF50",
-            fg="white",
-            padx=16,
-            pady=4,
-        ).pack(side=tk.LEFT, padx=6)
-        tk.Button(
-            btn_row,
-            text="取消",
-            command=top.destroy,
-            font=("微软雅黑", 9),
-            bg="#666666",
-            fg="white",
-            padx=16,
-            pady=4,
-        ).pack(side=tk.LEFT, padx=6)
 
     def evaluate_production_expiry_boxes(
         self, boxes: list[dict]
