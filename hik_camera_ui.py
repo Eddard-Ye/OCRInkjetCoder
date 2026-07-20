@@ -2015,17 +2015,11 @@ class HikCameraApp:
         if lbl is None:
             return
         cfg = self._get_white_bg_config_snapshot()
-        parts: List[str] = []
-        if cfg.enable_validation:
-            parts.append("校验开")
+        parts: List[str] = ["校验开"]
         if cfg.enable_aux_overlay:
             parts.append("辅助开")
-        if parts:
-            text = f"白底分割: {' | '.join(parts)}"
-            fg = "#66ccff"
-        else:
-            text = "白底分割: 关"
-            fg = "#888888"
+        text = f"白底分割: {' | '.join(parts)}"
+        fg = "#66ccff"
         lbl.config(text=text, fg=fg)
 
     def _open_white_bg_segment_config_dialog(self) -> None:
@@ -2046,7 +2040,7 @@ class HikCameraApp:
         var_close_k = tk.IntVar(value=cfg.close_k)
         var_open_k = tk.IntVar(value=cfg.open_k)
         var_min_area = tk.IntVar(value=min_area_to_slider(cfg.min_area))
-        var_enable_validation = tk.BooleanVar(value=bool(cfg.enable_validation))
+        # enable_validation always ON per project decision (UI toggle removed)
         var_enable_aux_overlay = tk.BooleanVar(value=bool(cfg.enable_aux_overlay))
 
         tk.Label(
@@ -2060,8 +2054,8 @@ class HikCameraApp:
         tk.Label(
             top,
             text=(
-                "HSV 阈值 + 形态学生成白底矩形；开启校验后仅保留落在该矩形内的 PaddleOCR 文本框。\n"
-                "拖动滑条或勾选选项时，识别结果图像会实时预览分割效果；点击「保存」后写入配置文件并关闭预览。"
+                "HSV 阈值 + 形态学生成白底矩形；白底校验始终开启（仅保留落在矩形内的 PaddleOCR 文本框）。\n"
+                "拖动滑条或勾选辅助配置时，识别结果图像会实时预览分割效果；点击「保存」后写入配置文件并关闭预览。"
             ),
             font=("微软雅黑", 8),
             bg="#2b2b2b",
@@ -2084,7 +2078,7 @@ class HikCameraApp:
                 close_k=clamp_close_k(int(var_close_k.get())),
                 open_k=clamp_open_k(int(var_open_k.get())),
                 min_area=min_area_from_slider(int(var_min_area.get())),
-                enable_validation=bool(var_enable_validation.get()),
+                enable_validation=True,  # always ON (checkbox removed)
                 enable_aux_overlay=bool(var_enable_aux_overlay.get()),
             ).normalized()
 
@@ -2176,19 +2170,6 @@ class HikCameraApp:
         flag_row.pack(fill="x", pady=(12, 4))
         tk.Checkbutton(
             flag_row,
-            text="开启白底校验（OCR 文本框须在白底矩形内）",
-            variable=var_enable_validation,
-            command=_on_flag_changed,
-            font=("微软雅黑", 9),
-            bg="#2b2b2b",
-            fg="#cccccc",
-            selectcolor="#1a1a1a",
-            activebackground="#2b2b2b",
-            activeforeground="#ffffff",
-            anchor="w",
-        ).pack(anchor="w")
-        tk.Checkbutton(
-            flag_row,
             text="开启辅助配置（预览/OCR 图叠加浅色白底掩膜与矩形）",
             variable=var_enable_aux_overlay,
             command=_on_flag_changed,
@@ -2217,12 +2198,10 @@ class HikCameraApp:
                 messagebox.showerror("保存失败", str(e), parent=top)
                 return
             self._refresh_white_bg_segment_status_label()
-            flags = []
-            if new_cfg.enable_validation:
-                flags.append("校验开")
+            flags = ["校验开"]
             if new_cfg.enable_aux_overlay:
                 flags.append("辅助开")
-            state = " | ".join(flags) if flags else "关"
+            state = " | ".join(flags)
             self.update_status(f"白底分割已保存: {state}", "#00ff00")
             _close_dialog(saved=True)
 
