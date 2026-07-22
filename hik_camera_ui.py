@@ -564,7 +564,7 @@ class HikCameraApp:
             fg="#cccccc",
         ).pack(side=tk.LEFT, padx=(0, 6))
 
-        tk.Button(
+        self.btn_cjk_config = tk.Button(
             strat_frame,
             text="编辑 CJK 配置",
             command=self._open_colon_cjk_strategy_config_dialog,
@@ -573,7 +573,8 @@ class HikCameraApp:
             fg="#ffffff",
             padx=8,
             pady=2,
-        ).pack(side=tk.LEFT, padx=4)
+        )
+        self.btn_cjk_config.pack(side=tk.LEFT, padx=4)
 
         self._colon_cjk_status_label = tk.Label(
             strat_frame,
@@ -592,7 +593,7 @@ class HikCameraApp:
             fg="#555555",
         ).pack(side=tk.LEFT, padx=6)
 
-        tk.Button(
+        self.btn_pixel_match_config = tk.Button(
             strat_frame,
             text="像素匹配配置",
             command=self._open_pixel_match_config_dialog,
@@ -601,7 +602,8 @@ class HikCameraApp:
             fg="#ffffff",
             padx=8,
             pady=2,
-        ).pack(side=tk.LEFT, padx=4)
+        )
+        self.btn_pixel_match_config.pack(side=tk.LEFT, padx=4)
 
         self._pixel_match_status_label = tk.Label(
             strat_frame,
@@ -632,7 +634,7 @@ class HikCameraApp:
         )
         self._gaussian_lowpass_status_label.pack(side=tk.LEFT, padx=(0, 6))
 
-        tk.Button(
+        self.btn_gaussian_config = tk.Button(
             strat_frame,
             text="高斯滤波配置",
             command=self._open_gaussian_lowpass_config_dialog,
@@ -641,7 +643,8 @@ class HikCameraApp:
             fg="#ffffff",
             padx=8,
             pady=2,
-        ).pack(side=tk.LEFT, padx=4)
+        )
+        self.btn_gaussian_config.pack(side=tk.LEFT, padx=4)
 
         self._refresh_gaussian_lowpass_status_label()
 
@@ -654,7 +657,7 @@ class HikCameraApp:
         )
         self._white_bg_segment_status_label.pack(side=tk.LEFT, padx=(0, 6))
 
-        tk.Button(
+        self.btn_white_bg_config = tk.Button(
             strat_frame,
             text="白底分割配置",
             command=self._open_white_bg_segment_config_dialog,
@@ -663,7 +666,8 @@ class HikCameraApp:
             fg="#ffffff",
             padx=8,
             pady=2,
-        ).pack(side=tk.LEFT, padx=4)
+        )
+        self.btn_white_bg_config.pack(side=tk.LEFT, padx=4)
 
         self._refresh_white_bg_segment_status_label()
 
@@ -931,63 +935,33 @@ class HikCameraApp:
         if btn_out is not None:
             btn_out.config(state=("normal" if logged_in else "disabled"))
 
-        restricted_grid = [
+        camera_restricted = [
             getattr(self, "btn_config_camera", None),
             getattr(self, "btn_toggle_trigger", None),
         ]
-        for w in restricted_grid:
+        config_restricted = [
+            getattr(self, "btn_cjk_config", None),
+            getattr(self, "btn_pixel_match_config", None),
+            getattr(self, "btn_gaussian_config", None),
+            getattr(self, "btn_white_bg_config", None),
+        ]
+
+        for w in camera_restricted:
             if w is None:
                 continue
             try:
-                if logged_in:
-                    info = w.grid_info()
-                    if not info:
-                        if w is self.btn_toggle_trigger:
-                            w.grid(
-                                row=1,
-                                column=0,
-                                columnspan=5,
-                                padx=5,
-                                pady=(0, 5),
-                            )
-                        elif w is self.btn_config_camera:
-                            w.grid(row=0, column=4, padx=5, pady=5)
+                if logged_in and self.b_open_device:
+                    w.config(state="normal")
                 else:
-                    w.grid_remove()
+                    w.config(state="disabled")
             except Exception:
                 pass
 
-        strat = getattr(self, "_auth_strat_frame", None)
-        control = getattr(self, "_control_frame", None)
-        if strat is not None:
+        for w in config_restricted:
+            if w is None:
+                continue
             try:
-                if logged_in:
-                    if not strat.winfo_manager():
-                        if control is not None:
-                            strat.pack(
-                                after=control,
-                                pady=(0, 4),
-                                fill="x",
-                                padx=10,
-                            )
-                        else:
-                            strat.pack(pady=(0, 4), fill="x", padx=10)
-                else:
-                    strat.pack_forget()
-            except Exception:
-                pass
-
-        # Re-apply camera-dependent button states after show/hide.
-        if logged_in and self.b_open_device:
-            try:
-                self.btn_config_camera.config(state="normal")
-                self.btn_toggle_trigger.config(state="normal")
-            except Exception:
-                pass
-        elif logged_in:
-            try:
-                self.btn_config_camera.config(state="disabled")
-                self.btn_toggle_trigger.config(state="disabled")
+                w.config(state=("normal" if logged_in else "disabled"))
             except Exception:
                 pass
 
@@ -1821,8 +1795,8 @@ class HikCameraApp:
         if cfg.enabled:
             lbl.config(
                 text=(
-                    f"像素: 开 (cnt>{cfg.min_window_count}, "
-                    f"宽>{cfg.min_pixel_width}, 长>{cfg.min_pixel_length})"
+                    f"像素: 开 (cnt>={cfg.min_window_count}, "
+                    f"宽>={cfg.min_pixel_width}, 长>={cfg.min_pixel_length})"
                 ),
                 fg="#66ccff",
             )
@@ -2018,7 +1992,7 @@ class HikCameraApp:
         ).pack(anchor="w")
 
         field_specs = [
-            ("最小窗口数", var_min_count, "文本框数量须严格大于该值"),
+            ("最小窗口数", var_min_count, "文本框数量须大于等于该值"),
             ("最小像素宽度", var_min_width, "垂直方向像素（面对屏幕的宽）"),
             ("最小像素长度", var_min_length, "水平方向像素（面对屏幕的长）"),
         ]
@@ -2073,8 +2047,8 @@ class HikCameraApp:
             self._refresh_pixel_match_status_label()
             state = "启用" if self._pixel_match_config.enabled else "关闭"
             self.update_status(
-                f"像素匹配已保存: {state}, cnt>{min_count}, "
-                f"宽>{min_width}, 长>{min_length}",
+                f"像素匹配已保存: {state}, cnt>={min_count}, "
+                f"宽>={min_width}, 长>={min_length}",
                 "#00ff00",
             )
             top.destroy()
@@ -3206,9 +3180,9 @@ class HikCameraApp:
             persist_original_capture=True,
         )
 
-    def toggle_hardware_trigger_mode(self) -> None:
+    def toggle_hardware_trigger_mode(self, *, require_auth: bool = True) -> None:
         """Switch between continuous preview and Line0 hardware trigger (saves JPEG on each frame)."""
-        if not self._require_auth("切换硬触发"):
+        if require_auth and not self._require_auth("切换硬触发"):
             return
         if not self.b_open_device:
             messagebox.showwarning("提示", "请先连接相机。")
@@ -4121,13 +4095,7 @@ class HikCameraApp:
         if not self.b_open_device:
             return
         if self._startup_hardware_trigger and not self.use_hw_trigger:
-            if not self._auth_logged_in:
-                print(
-                    "[HikCameraApp] startup hard-trigger skipped (not logged in)",
-                    flush=True,
-                )
-                return
-            self.toggle_hardware_trigger_mode()
+            self.toggle_hardware_trigger_mode(require_auth=False)
 
     def run(self):
         self.update_capture_stats_display()
@@ -4160,16 +4128,9 @@ if __name__ == "__main__":
     print("海康工业相机 + OCR识别系统")
     print("=" * 60)
     _startup_license_gate()
-    _args = _parse_startup_args()
-    _auto_connect = _args.auto_connect and _args.hardware_trigger
-    _hw_trigger = _auto_connect
-    if (_args.auto_connect or _args.hardware_trigger) and not _auto_connect:
-        print(
-            "提示: --auto-connect 与 --hardware-trigger 需同时使用才会自动连接并切硬触发；"
-            "当前按手动模式启动。"
-        )
+    _parse_startup_args()
     app = HikCameraApp(
-        startup_auto_connect=_auto_connect,
-        startup_hardware_trigger=_hw_trigger,
+        startup_auto_connect=True,
+        startup_hardware_trigger=True,
     )
     app.run()

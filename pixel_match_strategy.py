@@ -54,8 +54,8 @@ def diagnose_pixel_match(
     all_size_ok = True
     for i, box in enumerate(boxes):
         horiz, vert = box_screen_width_height(box)
-        width_ok = vert > float(cfg.min_pixel_width)
-        length_ok = horiz > float(cfg.min_pixel_length)
+        width_ok = vert >= float(cfg.min_pixel_width)
+        length_ok = horiz >= float(cfg.min_pixel_length)
         ok = width_ok and length_ok
         if not ok:
             all_size_ok = False
@@ -71,7 +71,7 @@ def diagnose_pixel_match(
             }
         )
 
-    count_ok = len(boxes) > int(cfg.min_window_count)
+    count_ok = len(boxes) >= int(cfg.min_window_count)
     passed = count_ok and all_size_ok and len(boxes) > 0
 
     failure: Optional[dict[str, Any]] = None
@@ -85,7 +85,7 @@ def diagnose_pixel_match(
             failure = {
                 "code": "insufficient_window_count",
                 "message": (
-                    f"Box count {len(boxes)} is not greater than min_window_count "
+                    f"Box count {len(boxes)} is less than min_window_count "
                     f"{cfg.min_window_count}"
                 ),
             }

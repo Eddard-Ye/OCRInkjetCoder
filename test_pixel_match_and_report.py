@@ -120,7 +120,7 @@ class PixelMatchStrategyTest(unittest.TestCase):
         self.assertEqual(horiz, 100.0)
         self.assertEqual(vert, 30.0)
 
-    def test_strict_greater_than_min_window_count(self) -> None:
+    def test_greater_equal_min_window_count(self) -> None:
         one_box = [_box("a", 80, 20)]
         cfg = PixelMatchConfig(
             enabled=True,
@@ -128,10 +128,30 @@ class PixelMatchStrategyTest(unittest.TestCase):
             min_pixel_width=10,
             min_pixel_length=50,
         )
-        self.assertFalse(diagnose_pixel_match(one_box, cfg)["passed"])
+        self.assertTrue(diagnose_pixel_match(one_box, cfg)["passed"])
 
         two_boxes = [_box("a", 80, 20), _box("b", 80, 20)]
-        self.assertTrue(diagnose_pixel_match(two_boxes, cfg)["passed"])
+        cfg_two = PixelMatchConfig(
+            enabled=True,
+            min_window_count=2,
+            min_pixel_width=10,
+            min_pixel_length=50,
+        )
+        self.assertTrue(diagnose_pixel_match(two_boxes, cfg_two)["passed"])
+        self.assertFalse(diagnose_pixel_match(one_box, cfg_two)["passed"])
+
+    def test_greater_equal_min_pixel_width_and_length(self) -> None:
+        cfg = PixelMatchConfig(
+            enabled=True,
+            min_window_count=1,
+            min_pixel_width=20,
+            min_pixel_length=80,
+        )
+        exact_box = [_box("a", 80, 20)]
+        self.assertTrue(diagnose_pixel_match(exact_box, cfg)["passed"])
+
+        short_box = [_box("a", 79, 20)]
+        self.assertFalse(diagnose_pixel_match(short_box, cfg)["passed"])
 
     def test_each_box_must_meet_width_and_length(self) -> None:
         boxes = [_box("a", 80, 20), _box("b", 40, 25)]
