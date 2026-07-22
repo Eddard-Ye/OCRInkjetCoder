@@ -75,7 +75,12 @@ from white_bg_segment import (
 )
 from ocr_check_report import build_ocr_check_report, format_check_report_for_ui
 from production_phrase_strategy import ColonCjkPhraseMatchStrategy
-from hik_camera_auth import AuthStore, DEFAULT_PASSWORD
+from hik_camera_auth import (
+    AuthStore,
+    DEFAULT_PASSWORD,
+    compute_auth_restricted_button_states,
+    hardware_trigger_toggle_blocked,
+)
 import license_manager
 
 _AUTH_SESSION_TIMEOUT_SEC = 30 * 60
@@ -946,14 +951,16 @@ class HikCameraApp:
             getattr(self, "btn_white_bg_config", None),
         ]
 
+        camera_state, config_state = compute_auth_restricted_button_states(
+            logged_in=logged_in,
+            camera_connected=bool(self.b_open_device),
+        )
+
         for w in camera_restricted:
             if w is None:
                 continue
             try:
-                if logged_in and self.b_open_device:
-                    w.config(state="normal")
-                else:
-                    w.config(state="disabled")
+                w.config(state=camera_state)
             except Exception:
                 pass
 
@@ -961,7 +968,7 @@ class HikCameraApp:
             if w is None:
                 continue
             try:
-                w.config(state=("normal" if logged_in else "disabled"))
+                w.config(state=config_state)
             except Exception:
                 pass
 
@@ -1992,7 +1999,7 @@ class HikCameraApp:
         ).pack(anchor="w")
 
         field_specs = [
-            ("最小窗口数", var_min_count, "文本框数量须大于等于该值"),
+            ("最小窗口数", var_min_count, "宽长均达标的文本框数量须大于等于该值"),
             ("最小像素宽度", var_min_width, "垂直方向像素（面对屏幕的宽）"),
             ("最小像素长度", var_min_length, "水平方向像素（面对屏幕的长）"),
         ]
@@ -3182,7 +3189,9 @@ class HikCameraApp:
 
     def toggle_hardware_trigger_mode(self, *, require_auth: bool = True) -> None:
         """Switch between continuous preview and Line0 hardware trigger (saves JPEG on each frame)."""
-        if require_auth and not self._require_auth("切换硬触发"):
+        if hardware_trigger_toggle_blocked(
+            require_auth=require_auth, logged_in=bool(self._auth_logged_in)
+        ) and not self._require_auth("切换硬触发"):
             return
         if not self.b_open_device:
             messagebox.showwarning("提示", "请先连接相机。")

@@ -51,14 +51,14 @@ def diagnose_pixel_match(
         }
 
     rows: list[dict[str, Any]] = []
-    all_size_ok = True
+    qualifying_count = 0
     for i, box in enumerate(boxes):
         horiz, vert = box_screen_width_height(box)
         width_ok = vert >= float(cfg.min_pixel_width)
         length_ok = horiz >= float(cfg.min_pixel_length)
         ok = width_ok and length_ok
-        if not ok:
-            all_size_ok = False
+        if ok:
+            qualifying_count += 1
         rows.append(
             {
                 "index": i,
@@ -71,8 +71,8 @@ def diagnose_pixel_match(
             }
         )
 
-    count_ok = len(boxes) >= int(cfg.min_window_count)
-    passed = count_ok and all_size_ok and len(boxes) > 0
+    count_ok = qualifying_count >= int(cfg.min_window_count)
+    passed = count_ok and len(boxes) > 0
 
     failure: Optional[dict[str, Any]] = None
     if not passed:
@@ -85,16 +85,10 @@ def diagnose_pixel_match(
             failure = {
                 "code": "insufficient_window_count",
                 "message": (
-                    f"Box count {len(boxes)} is less than min_window_count "
-                    f"{cfg.min_window_count}"
+                    f"Qualifying box count {qualifying_count} is less than "
+                    f"min_window_count {cfg.min_window_count}"
                 ),
-            }
-        else:
-            bad = [r for r in rows if not r["passed"]]
-            failure = {
-                "code": "box_size",
-                "message": f"{len(bad)} box(es) below min pixel width/length",
-                "detail": bad[:8],
+                "detail": [r for r in rows if not r["passed"]][:8],
             }
 
     return {

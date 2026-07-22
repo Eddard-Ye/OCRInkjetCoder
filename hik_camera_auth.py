@@ -132,3 +132,31 @@ class AuthStore:
         except Exception as e:
             return False, f"save failed: {e}"
         return True, ""
+
+
+def compute_auth_restricted_button_states(
+    *, logged_in: bool, camera_connected: bool
+) -> tuple[str, str]:
+    """
+    Return tk ``Button`` states for auth-gated controls.
+
+    - ``camera`` buttons (config camera / trigger toggle): need login **and** camera.
+    - ``config`` buttons (strategy editors): need login only.
+    """
+    camera_state = "normal" if logged_in and camera_connected else "disabled"
+    config_state = "normal" if logged_in else "disabled"
+    return camera_state, config_state
+
+
+def startup_should_switch_hardware_trigger(
+    *, startup_hardware_trigger: bool, use_hw_trigger: bool, camera_connected: bool
+) -> bool:
+    """Whether startup hook should call ``toggle_hardware_trigger_mode``."""
+    return bool(
+        startup_hardware_trigger and not use_hw_trigger and camera_connected
+    )
+
+
+def hardware_trigger_toggle_blocked(*, require_auth: bool, logged_in: bool) -> bool:
+    """True when manual trigger toggle must not proceed (login required)."""
+    return bool(require_auth and not logged_in)

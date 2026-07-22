@@ -153,15 +153,29 @@ class PixelMatchStrategyTest(unittest.TestCase):
         short_box = [_box("a", 79, 20)]
         self.assertFalse(diagnose_pixel_match(short_box, cfg)["passed"])
 
-    def test_each_box_must_meet_width_and_length(self) -> None:
+    def test_mixed_boxes_pass_when_enough_qualify(self) -> None:
         boxes = [_box("a", 80, 20), _box("b", 40, 25)]
         cfg = PixelMatchConfig(
             enabled=True,
-            min_window_count=0,
+            min_window_count=1,
             min_pixel_width=10,
             min_pixel_length=50,
         )
-        self.assertFalse(diagnose_pixel_match(boxes, cfg)["passed"])
+        result = diagnose_pixel_match(boxes, cfg)
+        self.assertTrue(result["passed"])
+        self.assertEqual(result["valid_box_count"], 1)
+
+    def test_mixed_boxes_fail_when_not_enough_qualify(self) -> None:
+        boxes = [_box("a", 80, 20), _box("b", 40, 25)]
+        cfg = PixelMatchConfig(
+            enabled=True,
+            min_window_count=2,
+            min_pixel_width=10,
+            min_pixel_length=50,
+        )
+        result = diagnose_pixel_match(boxes, cfg)
+        self.assertFalse(result["passed"])
+        self.assertEqual(result["valid_box_count"], 1)
 
 
 class OcrCheckReportOrIntegrationTest(unittest.TestCase):
